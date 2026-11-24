@@ -1,9 +1,35 @@
 # 🛰️ GEWOM — Global Early Warning OSINT Monitor
 
+<p align="center">
+  <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=600&size=28&duration=3000&pause=500&color=2CF5A6&center=true&vCenter=true&width=700&lines=GEWOM+%7C+Global+Early+Warning;OSINT+%7C+Conflict+Monitoring;AIS+%7C+Seismic+%7C+Telegram+%7C+RSS;Ukraine+%7C+Israel+%7C+Middle+East;Credibility+as+a+shield" alt="GEWOM" />
+</p>
+
 ![Version](https://img.shields.io/badge/version-2.4-blue)
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Status](https://img.shields.io/badge/status-active-success)
+![Status](https://img.shields.io/badge/status-active-success)[![bug](https://img.shields.io/badge/bug-d73a4a?style=flat-square&logo=github)](https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR/issues?q=label%3Abug)
+[![enhancement](https://img.shields.io/badge/enhancement-a2eeef?style=flat-square&logo=github)](https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR/issues?q=label%3Aenhancement)
+[![accessibility](https://img.shields.io/badge/accessibility-0075ca?style=flat-square&logo=github)](https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR/issues?q=label%3Aaccessibility)
+[![documentation](https://img.shields.io/badge/documentation-0075ca?style=flat-square&logo=github)](https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR/issues?q=label%3Adocumentation)
+[![security](https://img.shields.io/badge/security-b60205?style=flat-square&logo=github)](https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR/issues?q=label%3Asecurity)
+[![dependencies](https://img.shields.io/badge/dependencies-0366d6?style=flat-square&logo=github)](https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR/issues?q=label%3Adependencies)
+[![good first issue](https://img.shields.io/badge/good%20first%20issue-7057ff?style=flat-square&logo=github)](https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR/issues?q=label%3A%22good+first+issue%22)
+[![help wanted](https://img.shields.io/badge/help%20wanted-008672?style=flat-square&logo=github)](https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR/issues?q=label%3A%22help+wanted%22)
+[![question](https://img.shields.io/badge/question-d876e3?style=flat-square&logo=github)](https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR/issues?q=label%3Aquestion)
+[![duplicate](https://img.shields.io/badge/duplicate-cfd3d7?style=flat-square&logo=github)](https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR/issues?q=label%3Aduplicate)
+[![invalid](https://img.shields.io/badge/invalid-e4e669?style=flat-square&logo=github)](https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR/issues?q=label%3Ainvalid)
+[![wontfix](https://img.shields.io/badge/wontfix-ffffff?style=flat-square&logo=github)](https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR/issues?q=label%3Awontfix)
+[![Issues](https://img.shields.io/badge/Issues-ver%20todos-2cf5a6?style=for-the-badge&logo=github)](https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR/issues)
+[![Issues abiertos](https://img.shields.io/github/issues/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR?style=for-the-badge&logo=github&label=abiertos)](https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR/issues?q=is%3Aissue+is%3Aopen)
+[![PRs abiertos](https://img.shields.io/github/issues-pr/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR?style=for-the-badge&logo=github&label=PRs)](https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR/pulls?q=is%3Apr+is%3Aopen)
+[![Nuevo issue](https://img.shields.io/badge/Nuevo%20issue-abrir-ff2d55?style=for-the-badge&logo=github)](https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR/issues/new/choose)
+[![Security](https://img.shields.io/badge/Security%20Advisory-reportar-b60205?style=for-the-badge&logo=github)](https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR/security/advisories/new)
+[![Discussions](https://img.shields.io/badge/Discussions-abrir-7057ff?style=for-the-badge&logo=github)](https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR/discussions)
+[![Releases](https://img.shields.io/github/v/release/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR?style=for-the-badge&logo=github)](https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR/releases)
+[![License](https://img.shields.io/github/license/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR?style=for-the-badge&logo=opensourceinitiative)](https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR/blob/main/LICENSE)
+[![Stars](https://img.shields.io/github/stars/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR?style=for-the-badge&logo=github)](https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR/stargazers)
+
+
 
 Monitor **OSINT** de alerta temprana global: agrega alertas de misiles, drones, ataques, sismos/explosiones, comunicados oficiales y prensa de guerra desde **más de 20 fuentes públicas** (sin necesidad de claves API para funcionar).
 
