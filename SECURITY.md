@@ -11,15 +11,10 @@
 
 **NO abras un issue público para vulnerabilidades de seguridad.**
 
-Envía un correo a: **security@example.com** *(reemplaza con tu contacto real)*
+Usa el canal privado de GitHub:
+👉 https://github.com/Condor2026/GEWOM/security/advisories/new
 
-Incluye:
-
-- Descripción de la vulnerabilidad.
-- Pasos para reproducirla.
-- Impacto potencial.
-- Versión afectada.
-- Sugerencia de mitigación (si la tienes).
+Si no puedes usar GitHub Security Advisories, escribe a: **SpectrumSecIt@proton.me**
 
 ### Tiempo de respuesta
 
