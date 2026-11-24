@@ -64,7 +64,7 @@ Los casos de comportamiento abusivo, acosador o inaceptable de otro modo pueden
 ser reportados a los administradores del proyecto responsables del cumplimiento
 en:
 
-**conducta@example.com** *(reemplaza con tu contacto real)*
+**SpectrumSecIt@proton.me** *(reemplaza con tu contacto real)*
 
 Todas las quejas serán revisadas e investigadas de manera rápida y justa.
 
