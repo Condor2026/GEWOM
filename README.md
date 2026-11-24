@@ -46,7 +46,7 @@ Servidor local en `http://127.0.0.1:5000` con dashboard web y API JSON.
 ## 🚀 Instalación rápida
 
 ```bash
-git clone https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR.git
+git clone https://github.com/Condor2026/GLOBAL_EARLY_WARNING_OSINT_MONITOR
 cd GLOBAL_EARLY_WARNING_OSINT_MONITOR
 chmod +x install.sh
 ./install.sh
