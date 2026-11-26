@@ -1,8 +1,9 @@
 # 🛰️ GEWOM — Global Early Warning OSINT Monitor
-
 <p align="center">
   <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=600&size=28&duration=3000&pause=500&color=2CF5A6&center=true&vCenter=true&width=700&lines=GEWOM+%7C+Global+Early+Warning;OSINT+%7C+Conflict+Monitoring;AIS+%7C+Seismic+%7C+Telegram+%7C+RSS;Ukraine+%7C+Israel+%7C+Middle+East;Credibility+as+a+shield" alt="GEWOM" />
 </p>
+
+![TheCondor](GEWOM.jpg)
 
 ![Version](https://img.shields.io/badge/version-2.4-blue)
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
