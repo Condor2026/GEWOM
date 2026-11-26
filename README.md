@@ -22,6 +22,22 @@
 [![question](https://img.shields.io/badge/question-d876e3?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM.py/issues?q=label%3Aquestion)
 [![help wanted](https://img.shields.io/badge/help%20wanted-008672?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM.py/issues?q=label%3A%22help+wanted%22)
 [![good first issue](https://img.shields.io/badge/good%20first%20issue-7057ff?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM.py/issues?q=label%3A%22good+first+issue%22)
+![Type](https://img.shields.io/badge/type-OSINT-2CF5A6?style=for-the-badge)
+![Purpose](https://img.shields.io/badge/purpose-early%20warning-ff2d55?style=for-the-badge)
+![Domain](https://img.shields.io/badge/domain-conflict%20monitoring-ff9500?style=for-the-badge)
+![Mode](https://img.shields.io/badge/mode-real--time-5ee7ff?style=for-the-badge)
+![Sources](https://img.shields.io/badge/sources-20%2B-c77dff?style=for-the-badge)
+![API Keys](https://img.shields.io/badge/API%20keys-optional-2CF5A6?style=for-the-badge)
+![Self-hosted](https://img.shields.io/badge/self--hosted-127.0.0.1%3A5000-5ee7ff?style=for-the-badge)
+![Languages](https://img.shields.io/badge/languages-RU%20%7C%20UK%20%7C%20EN%20%7C%20HE%20%7C%20ES-ffd60a?style=for-the-badge)
+
+![Israel](https://img.shields.io/badge/Israel-Tzeva%20Adom%20%7C%20Oref-005EB8?style=flat-square)
+![Ukraine](https://img.shields.io/badge/Ukraine-alerts.com.ua%20%7C%20Kyiv%20Digital-FFD700?style=flat-square)
+![Seismic](https://img.shields.io/badge/seismic-USGS%20%7C%20EMSC%20%7C%20GEOFON-8B4513?style=flat-square)
+![NASA](https://img.shields.io/badge/NASA-FIRMS%20%7C%20EONET-0B3D91?style=flat-square&logo=nasa)
+![GDELT](https://img.shields.io/badge/GDELT-GEO%20%7C%20Cloud-2CF5A6?style=flat-square)
+![Telegram](https://img.shields.io/badge/Telegram-15%2B%20channels-2CA5E0?style=flat-square&logo=telegram)
+![RSS](https://img.shields.io/badge/RSS-war%20%7C%20OSINT%20%7C%20official-FFA500?style=flat-square&logo=rss)
 
 Monitor **OSINT** de alerta temprana global: agrega alertas de misiles, drones, ataques, sismos/explosiones, comunicados oficiales y prensa de guerra desde **más de 20 fuentes públicas** (sin necesidad de claves API para funcionar).
 
