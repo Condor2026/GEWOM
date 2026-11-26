@@ -10,19 +10,19 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Status](https://img.shields.io/badge/status-active-success)
 
-[![bug](https://img.shields.io/badge/bug-d73a4a?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM.py/issues?q=label%3Abug)
-[![enhancement](https://img.shields.io/badge/enhancement-a2eeef?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM.py/issues?q=label%3Aenhancement)
-[![documentation](https://img.shields.io/badge/documentation-0075ca?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM.py/issues?q=label%3Adocumentation)
-[![security](https://img.shields.io/badge/security-b60205?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM.py/issues?q=label%3Asecurity)
-[![accessibility](https://img.shields.io/badge/accessibility-0075ca?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM.py/issues?q=label%3Aaccessibility)
-[![source](https://img.shields.io/badge/source-c5def5?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM.py/issues?q=label%3Asource)
-[![telegram](https://img.shields.io/badge/telegram-2CA5E0?style=flat-square&logo=telegram)](https://github.com/Condor2026/GEWOM.py/issues?q=label%3Atelegram)
-[![translation](https://img.shields.io/badge/translation-5319e7?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM.py/issues?q=label%3Atranslation)
-[![detection](https://img.shields.io/badge/detection-fbca04?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM.py/issues?q=label%3Adetection)
+[![bug](https://img.shields.io/badge/bug-d73a4a?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM/issues?q=label%3Abug)
+[![enhancement](https://img.shields.io/badge/enhancement-a2eeef?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM/issues?q=label%3Aenhancement)
+[![documentation](https://img.shields.io/badge/documentation-0075ca?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM/issues?q=label%3Adocumentation)
+[![security](https://img.shields.io/badge/security-b60205?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM/issues?q=label%3Asecurity)
+[![accessibility](https://img.shields.io/badge/accessibility-0075ca?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM/issues?q=label%3Aaccessibility)
+[![source](https://img.shields.io/badge/source-c5def5?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM/issues?q=label%3Asource)
+[![telegram](https://img.shields.io/badge/telegram-2CA5E0?style=flat-square&logo=telegram)](https://github.com/Condor2026/GEWOM/issues?q=label%3Atelegram)
+[![translation](https://img.shields.io/badge/translation-5319e7?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM/issues?q=label%3Atranslation)
+[![detection](https://img.shields.io/badge/detection-fbca04?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM/issues?q=label%3Adetection)
 [![performance](https://img.shields.io/badge/performance-1d76db?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM.py/issues?q=label%3Aperformance)
 [![question](https://img.shields.io/badge/question-d876e3?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM.py/issues?q=label%3Aquestion)
-[![help wanted](https://img.shields.io/badge/help%20wanted-008672?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM.py/issues?q=label%3A%22help+wanted%22)
-[![good first issue](https://img.shields.io/badge/good%20first%20issue-7057ff?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM.py/issues?q=label%3A%22good+first+issue%22)
+[![help wanted](https://img.shields.io/badge/help%20wanted-008672?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM/issues?q=label%3A%22help+wanted%22)
+[![good first issue](https://img.shields.io/badge/good%20first%20issue-7057ff?style=flat-square&logo=github)](https://github.com/Condor2026/GEWOM/issues?q=label%3A%22good+first+issue%22)
 ![Type](https://img.shields.io/badge/type-OSINT-2CF5A6?style=for-the-badge)
 ![Purpose](https://img.shields.io/badge/purpose-early%20warning-ff2d55?style=for-the-badge)
 ![Domain](https://img.shields.io/badge/domain-conflict%20monitoring-ff9500?style=for-the-badge)
@@ -83,7 +83,7 @@ Servidor local en `http://127.0.0.1:5000` con dashboard web y API JSON.
 ## 🚀 Instalación rápida
 
 ```bash
-git clone https://github.com/Condor2026/GEWOM.py
+git clone https://github.com/Condor2026/GEWOM
 cd GEWOM.py
 chmod +x install.sh
 ./install.sh
@@ -95,7 +95,7 @@ Abre 👉 http://127.0.0.1:5000
 
 ## 🐧 Linux / macOS
 ```bash
-cd ~/GEWOM.py          # o donde tengas la carpeta
+cd ~/GEWOM         # o donde tengas la carpeta
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
