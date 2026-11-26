@@ -3798,37 +3798,1685 @@ def find_free_port(host: str, start: int, tries: int = 50) -> int:
 
 init_db()
 
+
+
+# ===== EXTENSIÓN v2.5 =====
+# -*- coding: utf-8 -*-
+# ============================================================
+# GLOBAL EARLY WARNING OSINT MONITOR — v2.5 (extensión sobre v2.4, sin tocar el original)
+#
+# USO:
+#   1) Guarda tu script v2.4 como  osint_monitor.py  (o define OSINT_BASE_MODULE=nombre_sin_.py)
+#   2) Deja este archivo en la MISMA carpeta y ejecútalo:   python osint_monitor_v25.py
+#
+# Añade:
+#   - Cruce de fuentes (incidentes por proximidad espacio-temporal + fuentes independientes + confianza)
+#   - Tooltip detallado al pasar el ratón por cualquier punto (+ enlaces entre reportes cruzados, mapa de calor)
+#   - Informe automatizado (HTML / Markdown / JSON), guardado periódico y descarga ZIP completa
+#   - Gráficos nuevos: radar, polar, burbujas, dispersión, áreas apiladas, histórico del índice, matriz de calor
+#   - Grupos de canales de Telegram (crear, activar/desactivar en bloque) y filtro por grupo/categoría
+#   - Muchas más fuentes (gobiernos, organismos, prensa, OSINT, estatales, GDACS, GDELT DOC, FIRMS abierto,
+#     OpenSky, NewsAPI opcional) con caché por fuente para no ser bloqueado
+#   - Lista de vigilancia (palabras clave + zonas geográficas) y notificaciones externas
+#     (NOTIFY_WEBHOOK_URL, NTFY_URL, TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)
+#
+# Variables opcionales: REPORT_INTERVAL_MIN (60, 0=off), REPORT_DIR (reports), REPORT_KEEP (72),
+#   CLUSTER_KM (120), CLUSTER_MIN (90), NEWSAPI_KEY, OPENSKY_USER/OPENSKY_PASS
+# ============================================================
+import os
+import re
+import io
+import sys
+import csv
+import copy
+import json
+import math
+import time
+import zipfile
+import sqlite3
+import hashlib
+import logging
+import importlib
+import threading
+import statistics
+import xml.etree.ElementTree as ET
+from collections import Counter, defaultdict, deque
+from datetime import datetime, timezone, timedelta
+from html import escape as hesc
+from typing import Any, Dict, List, Optional, Tuple
+
+BASE_MODULE = "GEWOM"
+base = sys.modules[__name__]
+
+from flask import jsonify, request, Response, send_from_directory
+
+app = base.app
+log = logging.getLogger("v25")
+VERSION = "2.5"
+base.APP_VERSION = VERSION
+
+CLUSTER_KM = float(os.getenv("CLUSTER_KM", "120"))
+CLUSTER_MIN = float(os.getenv("CLUSTER_MIN", "90"))
+CORR_WINDOW_H = float(os.getenv("CORR_WINDOW_H", "6"))
+REPORT_INTERVAL_MIN = float(os.getenv("REPORT_INTERVAL_MIN", "60"))
+REPORT_DIR = os.getenv("REPORT_DIR", "reports")
+REPORT_KEEP = int(os.getenv("REPORT_KEEP", "72"))
+NOTIFY_WEBHOOK_URL = os.getenv("NOTIFY_WEBHOOK_URL", "")
+NTFY_URL = os.getenv("NTFY_URL", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
+OPENSKY_USER = os.getenv("OPENSKY_USER", "")
+OPENSKY_PASS = os.getenv("OPENSKY_PASS", "")
+WATCHLIST_FILE = os.getenv("WATCHLIST_FILE", "watchlist.json")
+TG_GROUPS_FILE = os.getenv("TG_GROUPS_FILE", "telegram_groups.json")
+
+LEVEL = base._LEVEL_ORDER
+CRED_W = {"A": 1.0, "B": 0.7, "C": 0.4, "D": 0.2}
+
+# ------------------------------------------------------------
+# Categorías (grupos) de alertas
+# ------------------------------------------------------------
+GROUP_OF_TYPE = {
+    "missile_alert": "Alertas", "air_raid": "Alertas", "kyiv_alert": "Alertas", "drone_missile_track": "Alertas",
+    "earthquake": "Sísmico", "seismic_explosion": "Sísmico", "explosion_candidate": "Sísmico",
+    "nuclear_test_candidate": "Sísmico", "thermal_anomaly": "Satélite", "natural_event": "Naturales",
+    "disaster": "Naturales", "news": "Prensa/OSINT", "news_geo": "Prensa/OSINT", "war_news": "Prensa/OSINT",
+    "official_statement": "Gobierno", "state_media": "Estatal", "telegram_signal": "Telegram",
+    "acled_conflict": "Conflicto", "conflict_event": "Conflicto", "flight_activity": "Aviación",
+}
+TEXT_TYPES = {"telegram_signal", "news", "war_news", "state_media", "official_statement", "news_geo"}
+
+
+def alert_group(a: dict) -> str:
+    return GROUP_OF_TYPE.get(a.get("type"), "Otros")
+
+
+def _age(a: dict) -> float:
+    return base.age_seconds(a.get("detected_at", ""))
+
+
+def hasgeo(a: dict) -> bool:
+    la, lo = base.to_float(a.get("lat")), base.to_float(a.get("lon"))
+    return la is not None and lo is not None and not (la == 0 and lo == 0)
+
+
+# ============================================================
+# 1) MÁS FUENTES (listas existentes + nuevos fetchers)
+# ============================================================
+def _extend(lst: list, items: list):
+    have = {str(x[0]).lower() for x in lst}
+    for it in items:
+        if str(it[0]).lower() not in have:
+            lst.append(it)
+            have.add(str(it[0]).lower())
+
+
+# Noticias generales filtradas por palabras de ataque
+_extend(base.RSS_FEEDS, [
+    ("BBC Oriente Medio", "https://feeds.bbci.co.uk/news/world/middle_east/rss.xml"),
+    ("BBC Europa", "https://feeds.bbci.co.uk/news/world/europe/rss.xml"),
+    ("Guardian Ucrania", "https://www.theguardian.com/world/ukraine/rss"),
+    ("Guardian Mundo", "https://www.theguardian.com/world/rss"),
+    ("DW", "https://rss.dw.com/rdf/rss-en-all"),
+    ("France 24", "https://www.france24.com/en/rss"),
+    ("Sky News Mundo", "https://feeds.skynews.com/feeds/rss/world.xml"),
+    ("CNN Mundo", "http://rss.cnn.com/rss/edition_world.rss"),
+    ("NYT Mundo", "https://rss.nytimes.com/services/xml/rss/nyt/World.xml"),
+    ("NPR Mundo", "https://feeds.npr.org/1004/rss.xml"),
+    ("Jerusalem Post", "https://www.jpost.com/rss/rssfeedsheadlines.aspx"),
+    ("Euronews", "https://www.euronews.com/rss?format=mrss"),
+])
+# Prensa de guerra / OSINT / think tanks (nombre, url, credibilidad, filtrar)
+_extend(base.WAR_FEEDS, [
+    ("Militarnyi", "https://militarnyi.com/en/feed/", "B", True),
+    ("USNI News", "https://news.usni.org/feed", "B", True),
+    ("Defense News", "https://www.defensenews.com/arc/outboundfeeds/rss/?outputType=xml", "B", True),
+    ("Jamestown Foundation", "https://jamestown.org/feed/", "B", True),
+    ("The Insider (RU)", "https://theins.ru/en/feed", "B", True),
+    ("CSIS análisis", "https://www.csis.org/analysis/feed", "B", True),
+    ("Politico Europe", "https://www.politico.eu/feed/", "B", True),
+    ("The Diplomat", "https://thediplomat.com/feed/", "B", True),
+    ("Middle East Eye", "https://www.middleeasteye.net/rss", "B", True),
+    ("The New Arab", "https://www.newarab.com/rss", "B", True),
+    ("Haaretz", "https://www.haaretz.com/srv/haaretz-latest-headlines", "B", True),
+    ("ReliefWeb (ONU/OCHA)", "https://reliefweb.int/updates/rss.xml", "A", True),
+    ("ONU Noticias — Oriente Medio", "https://news.un.org/feed/subscribe/en/news/region/middle-east/feed/rss.xml", "A", False),
+    ("ONU Noticias — Europa", "https://news.un.org/feed/subscribe/en/news/region/europe/feed/rss.xml", "A", False),
+])
+# Comunicados de gobiernos y organismos (nombre, url, credibilidad, modo)
+_extend(base.STATEMENT_FEEDS, [
+    ("Ucrania Presidente (oficial)", "https://www.president.gov.ua/en/rss", "C", "gov"),
+    ("Ucrania MoD (oficial)", "https://www.mod.gov.ua/en/news/feed", "C", "gov"),
+    ("Ucrania MAE (oficial)", "https://mfa.gov.ua/en/rss", "C", "gov"),
+    ("Rusia MAE (oficial)", "https://mid.ru/en/rss/", "C", "gov"),
+    ("Reino Unido Downing St", "https://www.gov.uk/government/organisations/prime-ministers-office-10-downing-street.atom", "C", "gov"),
+    ("EE.UU. Ejército (noticias)", "https://www.army.mil/rss/2/", "C", "gov"),
+    ("EE.UU. Armada (noticias)", "https://www.navy.mil/DesktopModules/ArticleCS/RSS.ashx?ContentType=1&Site=1&max=10", "C", "gov"),
+    ("EE.UU. Fuerza Aérea", "https://www.af.mil/DesktopModules/ArticleCS/RSS.ashx?ContentType=1&Site=1&max=10", "C", "gov"),
+    ("UE Parlamento Europeo", "https://www.europarl.europa.eu/rss/doc/top-stories/en.xml", "C", "gov"),
+    ("ONU Oriente Medio (comunicados)", "https://news.un.org/feed/subscribe/en/news/region/middle-east/feed/rss.xml", "A", "gov"),
+    ("ONU Europa (comunicados)", "https://news.un.org/feed/subscribe/en/news/region/europe/feed/rss.xml", "A", "gov"),
+    ("ReliefWeb (comunicados)", "https://reliefweb.int/updates/rss.xml", "A", "gov"),
+])
+_extend(base.STATE_MEDIA_FEEDS, [
+    ("RIA Novosti EN (Rusia)", "https://en.ria.ru/export/rss2/archive/index.xml"),
+    ("Mehr (Irán)", "https://en.mehrnews.com/rss"),
+    ("Global Times (China)", "https://www.globaltimes.cn/rss/outbrain.xml"),
+    ("BelTA (Bielorrusia)", "https://eng.belta.by/rss"),
+])
+base.TELEGRAM_CHANNELS.extend([c for c in [
+    {"id": "V_Zelenskiy_official", "name": "Zelensky (oficial UA)", "lang": "uk"},
+    {"id": "dsns_telegram", "name": "DSNS Emergencias UA (oficial)", "lang": "uk"},
+    {"id": "mvs_ukraine", "name": "Interior UA (oficial)", "lang": "uk"},
+    {"id": "nexta_live", "name": "NEXTA Live", "lang": "ru"},
+    {"id": "meduzalive", "name": "Meduza Live", "lang": "ru"},
+    {"id": "tass_agency", "name": "TASS (estatal RU)", "lang": "ru"},
+    {"id": "rian_ru", "name": "RIA Novosti (estatal RU)", "lang": "ru"},
+    {"id": "kyivindependent_official", "name": "Kyiv Independent", "lang": "en"},
+    {"id": "RVvoenkor", "name": "Voenkor RV (RU)", "lang": "ru"},
+    {"id": "dva_majors", "name": "Dva Majors (RU)", "lang": "ru"},
+] if c["id"].lower() not in {x["id"].lower() for x in base.TELEGRAM_CHANNELS}])
+base.TG_CRED.update({"v_zelenskiy_official": "C", "dsns_telegram": "C", "mvs_ukraine": "C", "tass_agency": "C",
+                     "rian_ru": "C", "meduzalive": "B", "kyivindependent_official": "B", "nexta_live": "D"})
+base.CRED_RULES[:0] = [("gdacs", "A"), ("opensky", "A"), ("firms", "A"), ("gdelt doc", "B"), ("newsapi", "B")]
+
+
+def _nearest_place(lat: float, lon: float, maxkm: float = 60.0) -> Optional[Tuple[str, float]]:
+    best = None
+    for name, la, lo, _al in base.PLACES:
+        d = base.haversine_km(lat, lon, la, lo)
+        if d <= maxkm and (best is None or d < best[1]):
+            best = (name, d)
+    return best
+
+
+def fetch_gdacs() -> List[dict]:
+    """GDACS (ONU/UE): desastres con coordenadas (sin API)."""
+    name = "GDACS"
+    try:
+        r = base.create_session().get("https://www.gdacs.org/xml/rss.xml", headers=base.get_headers(html=True), timeout=15)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        now = datetime.now(timezone.utc)
+        out = []
+        for it in root.iter("item"):
+            f: Dict[str, str] = {}
+            for c in it:
+                f.setdefault(c.tag.split("}")[-1], (c.text or "").strip())
+            dt = base._parse_dt_any(f.get("pubDate"))
+            if not dt or (now - dt).total_seconds() > 72 * 3600:
+                continue
+            pt = (f.get("point") or "").split()
+            if len(pt) < 2:
+                continue
+            lat, lon = base.to_float(pt[0]), base.to_float(pt[1])
+            if lat is None or lon is None:
+                continue
+            lvl = (f.get("alertlevel") or "").lower()
+            sev = "high" if lvl == "red" else ("medium" if lvl == "orange" else "low")
+            out.append({"source": "GDACS (ONU/UE)", "type": "disaster", "region": f.get("title", "")[:120],
+                        "lat": lat, "lon": lon, "severity": sev, "description": f.get("title", "")[:200],
+                        "detected_at": dt.isoformat(), "link": f.get("link"), "cred": "A",
+                        "tags": [f.get("eventtype", "")] if f.get("eventtype") else [],
+                        "raw": {"alertlevel": lvl, "eventtype": f.get("eventtype")}})
+        return base._ok(name, out[:60])
+    except Exception as e:
+        return base._fail(name, e)
+
+
+def fetch_gdelt_doc() -> List[dict]:
+    """GDELT DOC 2.0 (público, sin key): artículos recientes sobre ataques/crisis en cualquier idioma."""
+    name = "GDELT DOC"
+    params = {"query": '(missile OR airstrike OR drone OR shelling OR ceasefire OR mobilization OR "state of emergency")',
+              "mode": "artlist", "format": "json", "maxrecords": 60, "timespan": "3h", "sort": "datedesc"}
+    try:
+        r = base.create_session().get("https://api.gdeltproject.org/api/v2/doc/doc", params=params,
+                                      headers=base.get_headers(), timeout=20)
+        r.raise_for_status()
+        arts = r.json().get("articles", [])
+        out = []
+        for a in arts[:60]:
+            title = str(a.get("title") or "").strip()
+            if not title:
+                continue
+            try:
+                dt = datetime.strptime(a.get("seendate", ""), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc).isoformat()
+            except Exception:
+                dt = base.now_iso()
+            lvl, tags = base.classify_statement(title)
+            loc = base.geolocate_text(title)
+            out.append({"source": "GDELT DOC (público)", "type": "news", "region": loc[2] if loc else str(a.get("domain", "")),
+                        "lat": loc[0] if loc else None, "lon": loc[1] if loc else None, "geo_approx": bool(loc),
+                        "severity": "high" if LEVEL[lvl] >= 2 else "low", "description": title[:220],
+                        "detected_at": dt, "link": a.get("url"), "cred": "B", "tags": tags,
+                        "raw": {"domain": a.get("domain"), "lang": a.get("language"), "country": a.get("sourcecountry")}})
+        return base._ok(name, out)
+    except Exception as e:
+        return base._fail(name, e)
+
+
+def fetch_firms_open() -> List[dict]:
+    """NASA FIRMS CSV abierto de Europa (24 h, sin MAP_KEY): anomalías térmicas fuertes en el corredor del conflicto."""
+    name = "FIRMS abierto"
+    if base.NASA_FIRMS_KEY != "TU_MAP_KEY_AQUI":
+        return base._skip(name, "Ya usas FIRMS con clave")
+    url = "https://firms.modaps.eosdis.nasa.gov/data/active_fire/suomi-npp-viirs-c2/csv/SUOMI_VIIRS_C2_Europe_24h.csv"
+    try:
+        r = base.create_session().get(url, headers=base.get_headers(), timeout=40)
+        r.raise_for_status()
+        rows = []
+        for row in csv.DictReader(io.StringIO(r.text)):
+            lat, lon = base.to_float(row.get("latitude")), base.to_float(row.get("longitude"))
+            frp = base.to_float(row.get("frp"), 0.0) or 0.0
+            if lat is None or lon is None or frp < base.FIRMS_MIN_FRP or str(row.get("confidence", "")).lower() in ("l", "low"):
+                continue
+            if not (44.0 <= lat <= 56.5 and 22.0 <= lon <= 46.0):
+                continue
+            rows.append((frp, lat, lon, row))
+        rows.sort(key=lambda x: x[0], reverse=True)
+        out = []
+        for frp, lat, lon, row in rows[:100]:
+            try:
+                dt = datetime.strptime(f"{row.get('acq_date')} {str(row.get('acq_time', '0')).zfill(4)}", "%Y-%m-%d %H%M")
+                det = dt.replace(tzinfo=timezone.utc).isoformat()
+            except Exception:
+                det = base.now_iso()
+            near = _nearest_place(lat, lon)
+            out.append({"source": "NASA FIRMS (abierto)", "type": "thermal_anomaly",
+                        "region": f"{near[0]} (~{near[1]:.0f} km)" if near else f"Lat {lat:.2f}, Lon {lon:.2f}",
+                        "place": near[0] if near else "", "lat": lat, "lon": lon, "severity": "medium",
+                        "description": f"Anomalía térmica (FRP={frp:.0f} MW) — puede ser incendio, industria o impacto",
+                        "detected_at": det, "cred": "A", "raw": {"frp": frp, "sat": row.get("satellite")}})
+        return base._ok(name, out)
+    except Exception as e:
+        return base._fail(name, e)
+
+
+_OS_HIST: Dict[str, deque] = defaultdict(lambda: deque(maxlen=48))
+OPENSKY_ZONES = [("Israel–Líbano–Siria", 29.0, 35.5, 33.0, 39.0), ("Polonia–Bálticos (frontera este)", 49.0, 57.0, 19.0, 29.0),
+                 ("Irán–Golfo", 24.0, 40.0, 44.0, 64.0)]
+
+
+def fetch_opensky() -> List[dict]:
+    """OpenSky (sin clave, cuota baja): nº de aeronaves en vuelo; caídas bruscas = posible cierre de espacio aéreo."""
+    name = "OpenSky"
+    out = []
+    errs = []
+    auth = (OPENSKY_USER, OPENSKY_PASS) if OPENSKY_USER else None
+    for zname, la0, la1, lo0, lo1 in OPENSKY_ZONES:
+        try:
+            r = base.create_session().get("https://opensky-network.org/api/states/all",
+                                          params={"lamin": la0, "lamax": la1, "lomin": lo0, "lomax": lo1},
+                                          headers=base.get_headers(), timeout=20, auth=auth)
+            r.raise_for_status()
+            states = r.json().get("states") or []
+            n = sum(1 for s in states if len(s) > 8 and not s[8])
+            hist = _OS_HIST[zname]
+            med = statistics.median(hist) if len(hist) >= 6 else None
+            hist.append(n)
+            sev, extra = "low", ""
+            if med and med >= 8 and n < 0.35 * med:
+                sev, extra = "high", f" — caída del {100 - 100 * n / med:.0f}% frente a lo habitual: posible cierre/restricción de espacio aéreo (heurístico)"
+            out.append({"source": "OpenSky (tráfico aéreo)", "type": "flight_activity", "region": zname,
+                        "place": zname, "lat": (la0 + la1) / 2, "lon": (lo0 + lo1) / 2, "severity": sev,
+                        "description": f"Tráfico aéreo {zname}: {n} aeronaves en vuelo" + (f" (mediana {med:.0f})" if med else "") + extra,
+                        "detected_at": base.now_iso(), "cred": "A", "raw": {"count": n, "median": med}})
+        except Exception as e:
+            errs.append(f"{zname}: {str(e)[:60]}")
+    if not out:
+        return base._fail(name, "; ".join(errs) or "sin datos")
+    if errs:
+        return base._warn(name, out, "; ".join(errs))
+    return base._ok(name, out)
+
+
+def fetch_newsapi() -> List[dict]:
+    name = "NewsAPI"
+    if not NEWSAPI_KEY:
+        return base._skip(name, "Sin NEWSAPI_KEY")
+    try:
+        r = base.create_session().get("https://newsapi.org/v2/everything", params={
+            "q": "(missile OR airstrike OR drone OR shelling OR ceasefire OR mobilization OR nuclear) AND (Ukraine OR Russia OR Israel OR Iran OR Gaza OR NATO)",
+            "language": "en", "sortBy": "publishedAt", "pageSize": 50, "apiKey": NEWSAPI_KEY}, timeout=15)
+        r.raise_for_status()
+        out = []
+        for a in r.json().get("articles", []):
+            title = str(a.get("title") or "")
+            lvl, tags = base.classify_statement(title)
+            loc = base.geolocate_text(title)
+            out.append({"source": "NewsAPI", "type": "news", "region": loc[2] if loc else (a.get("source") or {}).get("name", ""),
+                        "lat": loc[0] if loc else None, "lon": loc[1] if loc else None, "geo_approx": bool(loc),
+                        "severity": "high" if LEVEL[lvl] >= 2 else "low", "description": title[:220],
+                        "detected_at": base.normalize_dt(a.get("publishedAt")), "link": a.get("url"), "cred": "B", "tags": tags,
+                        "raw": {"outlet": (a.get("source") or {}).get("name")}})
+        return base._ok(name, out)
+    except Exception as e:
+        return base._fail(name, e)
+
+
+# ------------------------------------------------------------
+# Caché por fuente (evita machacar ~70 feeds cada 15 s y que te bloqueen)
+# ------------------------------------------------------------
+_REAL_MS: Dict[str, int] = {}
+_TTL_STATE: Dict[str, dict] = {}
+NO_FORCE = {"OpenSky", "GDELT DOC", "GDELT GEO", "FIRMS abierto", "NewsAPI"}
+
+
+def ttl_wrap(name: str, fn, ttl: float):
+    st = {"ts": 0.0, "data": [], "lock": threading.Lock()}
+    _TTL_STATE[name] = st
+
+    def w():
+        with st["lock"]:
+            if time.time() - st["ts"] < ttl:
+                return copy.deepcopy(st["data"])
+            t0 = time.time()
+            res = fn() or []
+            st["data"] = copy.deepcopy(res)
+            st["ts"] = time.time()
+            if base.SOURCE_STATUS.get(name, {}).get("status") == "error":
+                st["ts"] = time.time() - ttl + min(ttl, 30)  # reintenta pronto si falló
+            _REAL_MS[name] = int((time.time() - t0) * 1000)
+            return res
+    return w
+
+
+_TTL = {"RSS Noticias": 120, "Guerra (prensa/OSINT)": 120, "Comunicados oficiales": 120, "Medios estatales": 120,
+        "Telegram": 30, "GDELT GEO": 300, "USGS": 60, "EMSC": 60, "GEOFON": 120, "NASA EONET": 300,
+        "NASA FIRMS": 900, "GDELT": 120, "World Monitor": 120}
+_NEW_SOURCES = [("GDACS", fetch_gdacs, 300), ("GDELT DOC", fetch_gdelt_doc, 300), ("FIRMS abierto", fetch_firms_open, 1800),
+                ("OpenSky", fetch_opensky, 1800), ("NewsAPI", fetch_newsapi, 600)]
+base.SOURCES[:] = [(n, ttl_wrap(n, f, _TTL[n]) if n in _TTL else f) for n, f in base.SOURCES]
+for _n, _f, _t in _NEW_SOURCES:
+    if _n not in {n for n, _ in base.SOURCES}:
+        base.SOURCES.append((_n, ttl_wrap(_n, _f, _t)))
+
+_orig_invalidate = base.invalidate_cache
+
+
+def _invalidate_v25():
+    for n, st in _TTL_STATE.items():
+        st["ts"] = 0.0
+    _orig_invalidate()
+
+
+base.invalidate_cache = _invalidate_v25
+
+
+@app.before_request
+def _force_clears_ttl():
+    if request.path == "/api/alerts" and request.args.get("force") == "1":
+        for n, st in _TTL_STATE.items():
+            if n not in NO_FORCE:
+                st["ts"] = 0.0
+
+
+_orig_diag_targets = base.diag_targets
+
+
+def _diag_targets_v25():
+    t = _orig_diag_targets()
+    t += [("Alertas y sensores", "GDACS", "https://www.gdacs.org/xml/rss.xml", "feed"),
+          ("Alertas y sensores", "GDELT DOC", "https://api.gdeltproject.org/api/v2/doc/doc?query=missile&mode=artlist&format=json&maxrecords=1", "json"),
+          ("Alertas y sensores", "OpenSky", "https://opensky-network.org/api/states/all?lamin=31&lomin=34&lamax=32&lomax=35", "json")]
+    return t
+
+
+base.diag_targets = _diag_targets_v25
+
+
+# ============================================================
+# 2) GRUPOS DE TELEGRAM
+# ============================================================
+DEFAULT_TG_GROUPS = {
+    "Oficial Ucrania": ["GeneralStaffZSU", "SBUkr", "kpszsu", "ukrainenowenglish", "V_Zelenskiy_official", "dsns_telegram", "mvs_ukraine"],
+    "Alertas aéreas UA": ["air_alert_ua", "kpszsu", "operativnoZSU"],
+    "Oficial Rusia": ["mod_russia", "MID_Russia"],
+    "Oficial Israel": ["idfofficial"],
+    "Blogueros militares RU": ["rybar", "readovkanews", "wargonzo", "boris_rozhin", "RVvoenkor", "dva_majors"],
+    "Estatales RU": ["tass_agency", "rian_ru"],
+    "Independientes": ["meduzalive", "nexta_live", "kyivindependent_official"],
+    "OSINT / mapas": ["DeepStateUA", "militarysummary", "intelslava"],
+}
+_grp_lock = threading.Lock()
+
+
+def tg_groups_read() -> Dict[str, List[str]]:
+    with _grp_lock:
+        try:
+            with open(TG_GROUPS_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            g = d.get("groups", {})
+            if isinstance(g, dict):
+                return {str(k): [str(x) for x in v] for k, v in g.items() if isinstance(v, list)}
+        except Exception:
+            pass
+    return {k: list(v) for k, v in DEFAULT_TG_GROUPS.items()}
+
+
+def tg_groups_write(groups: Dict[str, List[str]]):
+    with _grp_lock:
+        tmp = TG_GROUPS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"groups": groups}, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, TG_GROUPS_FILE)
+
+
+_orig_get_tg = base.get_telegram_channels
+
+
+def _get_tg_v25(include_disabled: bool = False) -> List[dict]:
+    chans = _orig_get_tg(include_disabled=True)
+    with base._tg_lock:
+        cfg = base._tg_read_cfg()
+    dis = {str(x).lower() for x in cfg["disabled"]}
+    groups = tg_groups_read()
+    for c in chans:
+        if c["id"].lower() in dis:
+            c["enabled"] = False
+        c["groups"] = [g for g, m in groups.items() if c["id"].lower() in {x.lower() for x in m}]
+    return chans if include_disabled else [c for c in chans if c["enabled"]]
+
+
+base.get_telegram_channels = _get_tg_v25
+
+
+@app.route("/api/telegram/groups", methods=["GET", "POST"])
+def v25_tg_groups():
+    if request.method == "GET":
+        chans = {c["id"].lower(): c for c in base.get_telegram_channels(include_disabled=True)}
+        out = []
+        for name, members in tg_groups_read().items():
+            act = sum(1 for m in members if chans.get(m.lower(), {}).get("enabled"))
+            out.append({"name": name, "members": [{"id": m, "name": chans.get(m.lower(), {}).get("name", m),
+                                                   "enabled": bool(chans.get(m.lower(), {}).get("enabled"))} for m in members],
+                        "active": act, "enabled": bool(members) and act == len(members)})
+        return jsonify({"groups": out})
+    body = request.get_json(silent=True) or {}
+    name = re.sub(r"[\x00-\x1f]", "", str(body.get("name") or "")).strip()[:40]
+    if not name:
+        return jsonify({"error": "Nombre de grupo requerido"}), 400
+    groups = tg_groups_read()
+    cur = groups.setdefault(name, [])
+    warnings = []
+    known = {c["id"].lower() for c in base.get_telegram_channels(include_disabled=True)}
+    for raw in body.get("add") or []:
+        u = base.clean_username(raw)
+        if not u:
+            warnings.append(f"{raw}: usuario no válido")
+            continue
+        if u.lower() not in known:
+            try:
+                info = base.tg_channel_info(u)
+                if not info.get("exists"):
+                    warnings.append(f"@{u} no existe o no es público")
+                    continue
+                base.add_telegram_channel(u, info.get("title") or u)
+                known.add(u.lower())
+            except Exception as e:
+                warnings.append(f"@{u}: no verificado ({str(e)[:60]})")
+                continue
+        if u.lower() not in {x.lower() for x in cur}:
+            cur.append(u)
+    rem = {base.clean_username(x).lower() for x in (body.get("remove") or []) if base.clean_username(x)}
+    groups[name] = [x for x in cur if x.lower() not in rem]
+    tg_groups_write(groups)
+    base.invalidate_cache()
+    return jsonify({"ok": True, "warnings": warnings})
+
+
+@app.route("/api/telegram/groups/toggle", methods=["POST"])
+def v25_tg_group_toggle():
+    body = request.get_json(silent=True) or {}
+    members = tg_groups_read().get(str(body.get("name") or ""))
+    if members is None:
+        return jsonify({"error": "Grupo no encontrado"}), 404
+    enabled = bool(body.get("enabled"))
+    with base._tg_lock:
+        cfg = base._tg_read_cfg()
+        dis = [d for d in cfg["disabled"] if str(d).lower() not in {m.lower() for m in members}]
+        if not enabled:
+            dis += list(members)
+        cfg["disabled"] = dis
+        base._tg_write_cfg(cfg)
+    base.invalidate_cache()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/telegram/groups/<name>", methods=["DELETE"])
+def v25_tg_group_delete(name):
+    groups = tg_groups_read()
+    if name not in groups:
+        return jsonify({"error": "Grupo no encontrado"}), 404
+    groups.pop(name)
+    tg_groups_write(groups)
+    return jsonify({"ok": True})
+
+
+# ============================================================
+# 3) LISTA DE VIGILANCIA (palabras + zonas)
+# ============================================================
+_watch_lock = threading.Lock()
+
+
+def watch_read() -> Dict[str, list]:
+    with _watch_lock:
+        try:
+            with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            return {"keywords": [str(k) for k in d.get("keywords", [])], "zones": [z for z in d.get("zones", []) if isinstance(z, dict)]}
+        except Exception:
+            return {"keywords": [], "zones": []}
+
+
+def watch_write(w: Dict[str, list]):
+    with _watch_lock:
+        tmp = WATCHLIST_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(w, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, WATCHLIST_FILE)
+
+
+@app.route("/api/watchlist", methods=["GET", "POST", "DELETE"])
+def v25_watchlist():
+    w = watch_read()
+    if request.method == "GET":
+        return jsonify(w)
+    body = request.get_json(silent=True) or {}
+    if request.method == "POST":
+        kw = str(body.get("keyword") or "").strip().lower()[:60]
+        z = body.get("zone")
+        if kw and kw not in w["keywords"]:
+            w["keywords"].append(kw)
+        if isinstance(z, dict):
+            la, lo, rk = base.to_float(z.get("lat")), base.to_float(z.get("lon")), base.to_float(z.get("radius_km"), 100.0)
+            nm = str(z.get("name") or "").strip()[:40]
+            if nm and la is not None and lo is not None and -90 <= la <= 90 and -180 <= lo <= 180:
+                w["zones"] = [x for x in w["zones"] if x.get("name") != nm] + [{"name": nm, "lat": la, "lon": lo, "radius_km": max(1.0, min(rk or 100.0, 3000.0))}]
+            else:
+                return jsonify({"error": "Zona no válida (nombre, lat, lon)"}), 400
+        if not kw and not z:
+            return jsonify({"error": "Nada que añadir"}), 400
+    else:
+        kw = str(request.args.get("keyword") or "").strip().lower()
+        zn = str(request.args.get("zone") or "")
+        w["keywords"] = [k for k in w["keywords"] if k != kw]
+        w["zones"] = [z for z in w["zones"] if z.get("name") != zn]
+    watch_write(w)
+    base.invalidate_cache()
+    return jsonify({"ok": True, **w})
+
+
+def apply_watch(alerts: List[dict]) -> int:
+    w = watch_read()
+    if not w["keywords"] and not w["zones"]:
+        return 0
+    hits = 0
+    for a in alerts:
+        tags = a.setdefault("tags", [])
+        low = f"{a.get('description', '')} {a.get('region', '')}".lower()
+        hit = False
+        for kw in w["keywords"]:
+            if kw in low:
+                tags.append(f"kw:{kw}")
+                hit = True
+        if hasgeo(a) and is_precise(a):
+            for z in w["zones"]:
+                if base.haversine_km(float(a["lat"]), float(a["lon"]), z["lat"], z["lon"]) <= z["radius_km"]:
+                    tags.append(f"zona:{z['name']}")
+                    hit = True
+        if hit:
+            tags.append("vigilado")
+            hits += 1
+    return hits
+
+
+# ============================================================
+# 4) MOTOR DE CRUCE (incidentes multi-fuente)
+# ============================================================
+COUNTRY_NAMES = {c[0] for c in base.COUNTRIES}
+CORR_TYPES = {"missile_alert", "air_raid", "kyiv_alert", "drone_missile_track", "telegram_signal", "war_news", "news",
+              "news_geo", "seismic_explosion", "explosion_candidate", "nuclear_test_candidate", "thermal_anomaly",
+              "acled_conflict", "conflict_event", "state_media"}
+NON_CONFLICT = {"earthquake", "natural_event", "disaster", "flight_activity"}
+
+
+def is_precise(a: dict) -> bool:
+    if not hasgeo(a) or a.get("geo_known") is False:
+        return False
+    if a.get("type") == "missile_alert" and a.get("geo_approx"):
+        return False
+    return (a.get("place") or "") not in COUNTRY_NAMES
+
+
+def source_family(src: str) -> str:
+    s = (src or "").lower()
+    if "tzeva" in s or "oref" in s:
+        return "Alertas Israel (Oref)"
+    if any(k in s for k in ("alerts.com.ua", "alerts.in.ua", "ubilling", "kyiv digital")):
+        return "Alertas Ucrania (sistema oficial)"
+    return src
+
+
+def _tok(s: str) -> set:
+    return {w for w in re.findall(r"[^\W\d_]{4,}", (s or "").lower()) if w not in base._STOPWORDS}
+
+
+def build_incidents(alerts: List[dict]) -> List[dict]:
+    cands = [a for a in alerts if a.get("type") in CORR_TYPES and is_precise(a) and _age(a) <= CORR_WINDOW_H * 3600]
+    cands.sort(key=lambda a: a.get("detected_at", ""), reverse=True)
+    cands = cands[:900]
+    n = len(cands)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    ts = [base.epoch_of(a["detected_at"]) for a in cands]
+    la = [float(a["lat"]) for a in cands]
+    lo = [float(a["lon"]) for a in cands]
+    for i in range(n):
+        for j in range(i + 1, n):
+            if abs(ts[i] - ts[j]) > CLUSTER_MIN * 60 or abs(la[i] - la[j]) * 111.0 > CLUSTER_KM:
+                continue
+            if base.haversine_km(la[i], lo[i], la[j], lo[j]) <= CLUSTER_KM:
+                parent[find(i)] = find(j)
+    clusters: Dict[int, List[int]] = defaultdict(list)
+    for i in range(n):
+        clusters[find(i)].append(i)
+
+    incidents = []
+    for idxs in clusters.values():
+        mem = [cands[i] for i in idxs]
+        fams: Dict[str, List[dict]] = defaultdict(list)
+        for m in mem:
+            fams[source_family(m["source"])].append(m)
+        if len(fams) < 2:
+            continue
+        groups = Counter(alert_group(m) for m in mem)
+        wsum = sum(CRED_W.get(m.get("cred", "D"), 0.2) for m in mem) or 1.0
+        clat = sum(float(m["lat"]) * CRED_W.get(m.get("cred", "D"), 0.2) for m in mem) / wsum
+        clon = sum(float(m["lon"]) * CRED_W.get(m.get("cred", "D"), 0.2) for m in mem) / wsum
+        radius = max(base.haversine_km(clat, clon, float(m["lat"]), float(m["lon"])) for m in mem)
+        text_mem = [m for m in mem if m.get("type") in TEXT_TYPES]
+        nontext_fams = {source_family(m["source"]) for m in mem if m.get("type") not in TEXT_TYPES}
+        toks = [_tok(m.get("description", "")) for m in text_mem]
+        tp = list(range(len(text_mem)))
+
+        def tf(x):
+            while tp[x] != x:
+                tp[x] = tp[tp[x]]
+                x = tp[x]
+            return x
+
+        for i in range(len(text_mem)):
+            for j in range(i + 1, len(text_mem)):
+                u = toks[i] | toks[j]
+                if u and len(toks[i] & toks[j]) / len(u) >= 0.55:
+                    tp[tf(i)] = tf(j)
+        indep = len(nontext_fams) + len({tf(i) for i in range(len(text_mem))})
+        has_a = any(m.get("cred") == "A" for m in mem)
+        if has_a and len(groups) >= 2 and indep >= 3:
+            conf = "alta"
+        elif indep >= 3 or (has_a and indep >= 2):
+            conf = "media"
+        else:
+            conf = "baja"
+        if all(m.get("cred", "D") == "D" for m in mem):
+            conf = "baja"
+        score = sum(max(CRED_W.get(m.get("cred", "D"), 0.2) for m in ms) for ms in fams.values()) + 0.5 * (len(groups) - 1)
+        mem.sort(key=lambda m: m["detected_at"])
+        place = Counter((m.get("place") or m.get("region") or "?") for m in mem).most_common(1)[0][0]
+        sev = max((m.get("severity", "low") for m in mem), key=lambda s: LEVEL.get(s, 0))
+        t0, t1 = mem[0]["detected_at"], mem[-1]["detected_at"]
+        iid = hashlib.sha1(base.make_fingerprint(mem[0]).encode()).hexdigest()[:10]
+        srcs = sorted(fams)
+        inc = {
+            "id": iid, "place": str(place)[:40], "lat": clat, "lon": clon, "radius_km": round(radius, 1),
+            "first_seen": t0, "last_seen": t1, "n_alerts": len(mem), "n_sources": len(fams), "independent": indep,
+            "groups": dict(groups), "sources": srcs, "conf": conf, "score": min(100, int(score * 20)), "severity": sev,
+            "cred_mix": dict(Counter(m.get("cred", "D") for m in mem)),
+            "summary": f"{place}: {len(mem)} reportes de {len(fams)} fuentes ({', '.join(sorted(groups))}) entre "
+                       f"{t0[11:16]} y {t1[11:16]} UTC",
+            "members": [{"source": m["source"], "type": m.get("type"), "group": alert_group(m), "cred": m.get("cred", "D"),
+                         "severity": m.get("severity"), "detected_at": m["detected_at"], "description": str(m.get("description", ""))[:160],
+                         "link": m.get("link"), "lat": float(m["lat"]), "lon": float(m["lon"])} for m in mem[-25:]],
+        }
+        for m in mem:
+            m["incident_id"], m["corr_n"], m["corr_conf"], m["corr_sources"] = iid, len(fams) - 1, conf, srcs[:6]
+        incidents.append(inc)
+    rank = {"alta": 2, "media": 1, "baja": 0}
+    incidents.sort(key=lambda i: (rank[i["conf"]], i["score"], i["last_seen"]), reverse=True)
+    return incidents[:40]
+
+
+def build_matrix(alerts: List[dict], top: int = 12) -> dict:
+    cnt: Dict[str, Counter] = defaultdict(Counter)
+    for a in alerts:
+        if a.get("type") in NON_CONFLICT or a.get("geo_known") is False:
+            continue
+        if a.get("type") in TEXT_TYPES and not hasgeo(a):
+            continue
+        pl = str(a.get("place") or a.get("region") or "?")[:28]
+        cnt[pl][alert_group(a)] += 1
+    places = sorted(cnt, key=lambda p: -sum(cnt[p].values()))[:top]
+    groups = sorted({g for p in places for g in cnt[p]})
+    return {"places": places, "groups": groups, "cells": [[cnt[p][g] for g in groups] for p in places]}
+
+
+def activity_index(alerts: List[dict]) -> Tuple[int, dict]:
+    c30 = h30 = ex2 = st6 = 0
+    for a in alerts:
+        ag, sev = _age(a), a.get("severity")
+        if ag <= 1800:
+            c30 += sev == "critical"
+            h30 += sev == "high"
+        if a.get("type") in base.EXPLOSION_TYPES and ag <= 7200:
+            ex2 += 1
+        if a.get("type") == "official_statement" and sev in ("critical", "high") and ag <= 6 * 3600:
+            st6 += 1
+    return min(100, c30 * 8 + h30 * 3 + ex2 * 12 + st6 * 15), {"critical_30m": c30, "high_30m": h30, "explosions_2h": ex2, "statements_6h": st6}
+
+
+def level_of(idx: int) -> str:
+    return "NORMAL" if idx < 15 else ("VIGILANCIA" if idx < 35 else ("ELEVADO" if idx < 60 else "CRÍTICO"))
+
+
+# ------------------------------------------------------------
+# Histórico del índice
+# ------------------------------------------------------------
+_last_bucket = {"b": 0}
+
+
+def init_v25_db():
+    with base._db_lock:
+        conn = sqlite3.connect(base.DB_PATH, timeout=10)
+        conn.execute("CREATE TABLE IF NOT EXISTS index_history (ts TEXT PRIMARY KEY, idx INTEGER, critical INTEGER, total INTEGER, incidents INTEGER, explosions INTEGER)")
+        conn.commit()
+        conn.close()
+
+
+def log_index(idx: int, stats: dict, ninc: int):
+    b = int(time.time() // 300)
+    if b == _last_bucket["b"]:
+        return
+    _last_bucket["b"] = b
+    try:
+        with base._db_lock:
+            conn = sqlite3.connect(base.DB_PATH, timeout=10)
+            try:
+                conn.execute("INSERT OR REPLACE INTO index_history VALUES (?,?,?,?,?,?)",
+                             (base.now_iso()[:16], idx, stats.get("critical", 0), stats.get("total", 0), ninc, stats.get("explosions", 0)))
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception as e:
+        log.warning(f"index_history: {e}")
+
+
+def index_history(hours: float) -> List[dict]:
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()[:16]
+    try:
+        with base._db_lock:
+            conn = sqlite3.connect(base.DB_PATH, timeout=10)
+            try:
+                rows = conn.execute("SELECT ts, idx, critical, total, incidents FROM index_history WHERE ts >= ? ORDER BY ts", (since,)).fetchall()
+            finally:
+                conn.close()
+        return [{"ts": r[0], "idx": r[1], "critical": r[2], "total": r[3], "incidents": r[4]} for r in rows]
+    except Exception:
+        return []
+
+
+# ------------------------------------------------------------
+# Notificaciones externas
+# ------------------------------------------------------------
+_notified: set = set()
+_notified_order: deque = deque(maxlen=2000)
+_warm = {"done": False}
+
+
+def send_external(text: str) -> List[str]:
+    sent = []
+    import requests as rq
+    try:
+        if NOTIFY_WEBHOOK_URL:
+            rq.post(NOTIFY_WEBHOOK_URL, json={"text": text, "content": text}, timeout=10)
+            sent.append("webhook")
+    except Exception as e:
+        log.warning(f"notify webhook: {str(e)[:80]}")
+    try:
+        if NTFY_URL:
+            rq.post(NTFY_URL, data=text.encode("utf-8"), headers={"Title": "OSINT Monitor"}, timeout=10)
+            sent.append("ntfy")
+    except Exception as e:
+        log.warning(f"notify ntfy: {str(e)[:80]}")
+    try:
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            rq.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    data={"chat_id": TELEGRAM_CHAT_ID, "text": text[:3900]}, timeout=10)
+            sent.append("telegram")
+    except Exception as e:
+        log.warning("notify telegram: error")
+    return sent
+
+
+def notify_events(alerts: List[dict], incidents: List[dict], special: List[dict]):
+    ev: List[Tuple[str, str]] = []
+    for i in incidents:
+        if i["conf"] in ("alta", "media") and LEVEL.get(i["severity"], 0) >= 2:
+            ev.append(("inc:" + i["id"], f"🔗 Incidente cruzado [{i['conf']}] — {i['summary']}"))
+    for s in special:
+        ev.append(("st:" + hashlib.sha1(s["description"].encode("utf-8", "ignore")).hexdigest()[:12], f"📜 Comunicado ({s['source']}): {s['description']}"))
+    for a in alerts:
+        fp = base.make_fingerprint(a)
+        if a.get("type") in base.EXPLOSION_TYPES and "correlado" in (a.get("tags") or []) and _age(a) <= 7200:
+            ev.append(("ex:" + fp, f"💥 {a['description']}"))
+        elif "vigilado" in (a.get("tags") or []) and _age(a) <= 3600:
+            ev.append(("w:" + fp, f"👁 Vigilancia [{a['source']}]: {a['description'][:200]}"))
+    new = [(k, t) for k, t in ev if k not in _notified]
+    for k, _t in new:
+        _notified.add(k)
+        _notified_order.append(k)
+    while len(_notified) > 2500 and _notified_order:
+        _notified.discard(_notified_order.popleft())
+    if not _warm["done"]:
+        _warm["done"] = True  # el primer ciclo solo registra lo existente, no envía
+        return
+    if new and (NOTIFY_WEBHOOK_URL or NTFY_URL or (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)):
+        text = "\n".join(t for _k, t in new[:6])
+        threading.Thread(target=send_external, args=(text,), daemon=True).start()
+
+
+# ------------------------------------------------------------
+# Enriquecimiento de cada ciclo de fetch_all
+# ------------------------------------------------------------
+_orig_fetch_all = base.fetch_all
+
+
+def fetch_all_v25() -> Dict[str, Any]:
+    result = _orig_fetch_all()
+    try:
+        alerts, stats = result["alerts"], result["stats"]
+        tgmap: Dict[str, List[str]] = defaultdict(list)
+        for g, members in tg_groups_read().items():
+            for m in members:
+                tgmap[m.lower()].append(g)
+        for a in alerts:
+            a["group"] = alert_group(a)
+            a.setdefault("tags", [])
+            if a.get("type") == "telegram_signal":
+                for g in tgmap.get(str((a.get("raw") or {}).get("channel", "")).lower(), []):
+                    a["tags"].append(f"grupo:{g}")
+        watch_hits = apply_watch(alerts)
+        incidents = build_incidents(alerts)
+        idx, parts = activity_index(alerts)
+        stats["incidents"] = incidents
+        stats["matrix"] = build_matrix(alerts)
+        stats["by_group"] = dict(Counter(a["group"] for a in alerts))
+        stats["seismic_points"] = [{"mag": a["raw"].get("mag"), "depth": a["raw"].get("depth"), "type": a["type"], "place": a.get("region"),
+                                    "t": a["detected_at"]} for a in alerts if a.get("type") in base.SEISMIC_TYPES
+                                   and isinstance(a.get("raw"), dict) and a["raw"].get("mag") is not None][:200]
+        stats["index"], stats["level"], stats["index_parts"] = idx, level_of(idx), parts
+        stats["watch_hits"] = watch_hits
+        stats["version"] = VERSION
+        for n, ms in _REAL_MS.items():
+            if n in stats["source_status"]:
+                stats["source_status"][n]["ms"] = ms
+            with base._status_lock:
+                if n in base.SOURCE_STATUS:
+                    base.SOURCE_STATUS[n]["ms"] = ms
+        log_index(idx, stats, len(incidents))
+        notify_events(alerts, incidents, stats.get("special_statements", []))
+    except Exception as e:
+        log.warning(f"enriquecimiento v2.5: {e}")
+    return result
+
+
+base.fetch_all = fetch_all_v25
+
+
+# ============================================================
+# 5) INFORME AUTOMATIZADO
+# ============================================================
+def live_snapshot(force: bool = False) -> Dict[str, Any]:
+    if not force:
+        d, _age_s = base._cached_fresh()
+        if d:
+            return d
+    with base._fetch_lock:
+        d = base.fetch_all()
+        with base._cache_lock:
+            base._cache["data"] = d
+            base._cache["last_fetch"] = datetime.now(timezone.utc)
+    return d
+
+
+def hist_group_timeline(rows: List[dict], hours: float) -> dict:
+    nb = int(min(48, max(6, round(hours))))
+    bin_s = hours * 3600.0 / nb
+    now = time.time()
+    series: Dict[str, List[int]] = defaultdict(lambda: [0] * nb)
+    for r in rows:
+        k = int((now - base.epoch_of(r["detected_at"])) // bin_s)
+        if 0 <= k < nb:
+            series[GROUP_OF_TYPE.get(r.get("type"), "Otros")][nb - 1 - k] += 1
+    labels = [datetime.fromtimestamp(now - (nb - 1 - i) * bin_s, tz=timezone.utc).strftime("%d %H:%M") for i in range(nb)]
+    return {"labels": labels, "series": dict(series)}
+
+
+def collect_report(hours: float = 24.0) -> Dict[str, Any]:
+    hours = max(1.0, min(float(hours), 168.0))
+    snap = live_snapshot()
+    alerts, stats = snap["alerts"], snap["stats"]
+    hist = base.query_history(hours=hours, limit=5000)
+    now = time.time()
+    half = hours * 1800.0
+    rec = sum(1 for r in hist if r["severity"] in ("critical", "high") and now - base.epoch_of(r["detected_at"]) <= half)
+    prev = sum(1 for r in hist if r["severity"] in ("critical", "high") and half < now - base.epoch_of(r["detected_at"]) <= 2 * half)
+    tlabel = "al alza" if rec > prev * 1.25 + 1 else ("a la baja" if rec * 1.25 + 1 < prev else "estable")
+    incidents = stats.get("incidents", [])
+    idx, level = stats.get("index", 0), stats.get("level", level_of(0))
+    win = hours * 3600
+    statements = sorted([a for a in alerts if a.get("type") == "official_statement" and _age(a) <= win],
+                        key=lambda a: (LEVEL.get(a["severity"], 0), a["detected_at"]), reverse=True)[:20]
+    expl = [a for a in alerts if a.get("type") in base.EXPLOSION_TYPES and _age(a) <= win][:15]
+    state = [a for a in alerts if a.get("type") == "state_media" and _age(a) <= win][:8]
+    src_health = [{"name": n, "status": s.get("status"), "count": s.get("count", 0), "ms": s.get("ms", 0),
+                   "error": s.get("error", ""), "disabled": bool(s.get("disabled"))} for n, s in sorted(stats.get("source_status", {}).items())]
+    rep: Dict[str, Any] = {
+        "generated_at": base.now_iso(), "hours": hours, "version": VERSION, "index": idx, "level": level,
+        "index_parts": stats.get("index_parts", {}), "trend": {"recent": rec, "previous": prev, "label": tlabel},
+        "live_total": stats.get("total", 0), "live_critical": stats.get("critical", 0),
+        "incidents": incidents[:15], "regions": stats.get("matrix", {}),
+        "by_group": dict(Counter(GROUP_OF_TYPE.get(r.get("type"), "Otros") for r in hist)),
+        "by_sev": dict(Counter(r["severity"] for r in hist)), "by_cred": dict(Counter(r.get("cred", "D") for r in hist)),
+        "by_source": dict(Counter(r["source"] for r in hist).most_common(12)),
+        "history_rows": len(hist), "timeline": hist_group_timeline(hist, hours),
+        "statements": [{"source": a["source"], "severity": a["severity"], "description": a["description"], "detected_at": a["detected_at"],
+                        "link": a.get("link"), "cred": a.get("cred", "C"), "tags": a.get("tags", [])} for a in statements],
+        "explosions": [{"description": a["description"], "severity": a["severity"], "detected_at": a["detected_at"], "tags": a.get("tags", [])} for a in expl],
+        "state_media": [{"source": a["source"], "description": a["description"], "detected_at": a["detected_at"], "link": a.get("link")} for a in state],
+        "telegram_unverified": sum(1 for a in alerts if a.get("type") == "telegram_signal" and _age(a) <= win),
+        "sources": src_health, "watch_hits": stats.get("watch_hits", 0),
+        "watch_items": [{"source": a["source"], "description": a["description"][:200], "detected_at": a["detected_at"],
+                         "tags": [t for t in a.get("tags", []) if t.startswith(("kw:", "zona:"))]}
+                        for a in alerts if "vigilado" in (a.get("tags") or [])][:15],
+        "index_history": index_history(hours),
+    }
+    rep["findings"] = make_findings(rep)
+    rep["headline"] = (f"{level}: {len(incidents)} incidente(s) con cruce de fuentes, "
+                       f"{stats.get('index_parts', {}).get('critical_30m', 0)} alerta(s) crítica(s) en los últimos 30 min")
+    return rep
+
+
+def make_findings(rep: Dict[str, Any]) -> List[str]:
+    f = [f"Nivel de actividad {rep['level']} (índice {rep['index']}/100). Tendencia {rep['trend']['label']}: "
+         f"{rep['trend']['recent']} eventos high/critical en la segunda mitad de la ventana frente a {rep['trend']['previous']} en la primera."]
+    incs = rep["incidents"]
+    if incs:
+        i = incs[0]
+        f.append(f"Cruce más relevante: {i['summary']} — confianza {i['conf']}, ≈{i['independent']} fuentes independientes, puntuación {i['score']}/100.")
+        f.append(f"{len(incs)} incidente(s) con cruce de fuentes; {sum(1 for i in incs if i['conf'] == 'alta')} de confianza alta y {sum(1 for i in incs if i['conf'] == 'media')} media.")
+    else:
+        f.append("Sin incidentes con cruce de fuentes en la ventana de correlación actual.")
+    reg = rep["regions"]
+    if reg.get("places"):
+        tot = sorted(zip(reg["places"], [sum(r) for r in reg["cells"]]), key=lambda x: -x[1])[:3]
+        f.append("Zonas con más reportes: " + ", ".join(f"{p} ({n})" for p, n in tot) + ".")
+    if rep["explosions"]:
+        corr = sum(1 for e in rep["explosions"] if "correlado" in e["tags"])
+        f.append(f"{len(rep['explosions'])} evento(s) sísmico(s) anómalo(s) compatible(s) con explosión (heurístico); {corr} coinciden con alertas de ataque cercanas.")
+    sts = [s for s in rep["statements"] if s["severity"] in ("critical", "high")]
+    if sts:
+        f.append(f"{len(sts)} comunicado(s) oficial(es) de severidad alta (p. ej. {sts[0]['source'].replace('Comunicado — ', '')}: {sts[0]['description'][:110]}).")
+    if rep["state_media"]:
+        f.append(f"{len(rep['state_media'])} titular(es) de medios estatales: reflejan la versión de cada gobierno, no hechos verificados.")
+    f.append(f"{rep['telegram_unverified']} señal(es) de Telegram sin verificar en la ventana.")
+    if rep["watch_hits"]:
+        f.append(f"{rep['watch_hits']} alerta(s) coinciden con tu lista de vigilancia.")
+    down = [s["name"] for s in rep["sources"] if s["status"] == "error" and not s["disabled"]]
+    if down:
+        f.append(f"Fuentes caídas ({len(down)}): {', '.join(down[:8])}. La cobertura puede estar incompleta.")
+    return f
+
+
+CAVEATS = [
+    "Este informe es una agregación automática de fuentes abiertas; no confirma hechos. En un conflicto ninguna fuente garantiza veracidad.",
+    "La credibilidad (A/B/C/D) indica el TIPO de fuente (oficial/instrumental, prensa/OSINT, parte implicada, no verificado), no la certeza del dato.",
+    "Los cruces agrupan reportes por proximidad (≤%d km) y tiempo (≤%d min). Se cuentan como independientes solo fuentes distintas; "
+    "alertas del mismo sistema oficial y mensajes casi idénticos cuentan una vez. Un cruce eleva la confianza, no la convierte en certeza." % (CLUSTER_KM, CLUSTER_MIN),
+    "Candidatos a explosión (sismos someros en zona de conflicto) son heurísticos y pueden ser sismos reales, minería o demoliciones.",
+    "Las anomalías térmicas pueden ser incendios o industria. Los medios estatales y Telegram reflejan la versión de quien los emite.",
+    "El historial solo contiene lo que el monitor ha registrado desde que se puso en marcha.",
+]
+
+SEV_ES = {"critical": "crítica", "high": "alta", "medium": "media", "low": "baja"}
+
+
+def render_md(rep: Dict[str, Any]) -> str:
+    L = [f"# Informe de situación — OSINT Early Warning v{rep['version']}",
+         f"_Generado: {rep['generated_at']} UTC · ventana: {rep['hours']:.0f} h_", "",
+         f"## {rep['headline']}", f"**Nivel:** {rep['level']} · **Índice:** {rep['index']}/100 · **Tendencia:** {rep['trend']['label']}", "",
+         "## Hallazgos clave"] + [f"- {x}" for x in rep["findings"]] + ["", "## Incidentes con cruce de fuentes"]
+    if rep["incidents"]:
+        L += ["| Lugar | Confianza | Puntuación | Fuentes indep. | Severidad | Última | Fuentes |", "|---|---|---|---|---|---|---|"]
+        for i in rep["incidents"]:
+            L.append(f"| {i['place']} | {i['conf']} | {i['score']} | {i['independent']} | {SEV_ES.get(i['severity'], i['severity'])} | {i['last_seen'][11:16]} UTC | {', '.join(i['sources'])[:120]} |")
+    else:
+        L.append("Sin incidentes cruzados.")
+    L += ["", "## Reportes por grupo (historial)"] + [f"- {k}: {v}" for k, v in sorted(rep["by_group"].items(), key=lambda x: -x[1])]
+    L += ["", "## Comunicados oficiales"]
+    L += [f"- [{s['cred']}] {s['detected_at'][:16]} · {s['source']}: {s['description']}" for s in rep["statements"]] or ["- Ninguno relevante."]
+    L += ["", "## Posibles explosiones sísmicas"] + ([f"- {e['detected_at'][:16]} · {e['description']}" for e in rep["explosions"]] or ["- Ninguna."])
+    L += ["", "## Medios estatales (versión de parte)"] + ([f"- {s['source']}: {s['description']}" for s in rep["state_media"]] or ["- Ninguno."])
+    if rep["watch_items"]:
+        L += ["", "## Lista de vigilancia"] + [f"- {w['source']}: {w['description']} ({', '.join(w['tags'])})" for w in rep["watch_items"]]
+    L += ["", "## Estado de fuentes"] + [f"- {s['name']}: {s['status']}{' (desactivada)' if s['disabled'] else ''} · {s['count']} · {s['ms']} ms" + (f" · {s['error']}" if s["error"] else "") for s in rep["sources"]]
+    L += ["", "## Avisos y metodología"] + [f"- {c}" for c in CAVEATS]
+    return "\n".join(L)
+
+
+_E = lambda x: hesc(str(x if x is not None else ""), quote=True)
+PAL = ["#2f6fed", "#e5484d", "#f5a524", "#17c964", "#9b59f6", "#06b6d4", "#ec4899", "#71717a", "#84cc16", "#f97316"]
+GCOL = {"Alertas": "#e5484d", "Sísmico": "#9b59f6", "Satélite": "#f5a524", "Naturales": "#06b6d4", "Prensa/OSINT": "#2f6fed",
+        "Gobierno": "#17c964", "Estatal": "#eab308", "Telegram": "#38bdf8", "Conflicto": "#ec4899", "Aviación": "#71717a", "Otros": "#a1a1aa"}
+
+
+def svg_hbar(title, pairs, color="#2f6fed", w=560):
+    pairs = list(pairs)[:14]
+    if not pairs:
+        return f'<p class="mut">{_E(title)}: sin datos</p>'
+    rh, lw = 20, 190
+    h = 34 + rh * len(pairs)
+    mx = max(v for _l, v in pairs) or 1
+    bw = w - lw - 60
+    s = [f'<svg viewBox="0 0 {w} {h}" width="100%"><text x="0" y="16" class="t">{_E(title)}</text>']
+    for i, (l, v) in enumerate(pairs):
+        y, ww = 30 + i * rh, max(1.0, bw * v / mx)
+        s.append(f'<text x="{lw - 6}" y="{y + 13}" text-anchor="end" class="l">{_E(str(l)[:30])}</text>'
+                 f'<rect x="{lw}" y="{y + 2}" width="{ww:.1f}" height="14" fill="{color}" rx="2"/>'
+                 f'<text x="{lw + ww + 4:.1f}" y="{y + 13}" class="l">{v}</text>')
+    return "".join(s) + "</svg>"
+
+
+def svg_donut(title, pairs, colors=None, w=560):
+    pairs = [(l, v) for l, v in pairs if v]
+    tot = sum(v for _l, v in pairs)
+    if not tot:
+        return f'<p class="mut">{_E(title)}: sin datos</p>'
+    r, cx, cy = 60, 90, 100
+    C = 2 * math.pi * r
+    s = [f'<svg viewBox="0 0 {w} 200" width="100%"><text x="0" y="16" class="t">{_E(title)}</text>']
+    off = 0.0
+    for i, (l, v) in enumerate(pairs):
+        col = (colors or {}).get(l) or PAL[i % len(PAL)]
+        ln = C * v / tot
+        s.append(f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="{col}" stroke-width="28" stroke-dasharray="{ln:.2f} {C - ln:.2f}" '
+                 f'stroke-dashoffset="{-off:.2f}" transform="rotate(-90 {cx} {cy})"/>')
+        s.append(f'<rect x="200" y="{36 + i * 18}" width="12" height="12" fill="{col}"/><text x="218" y="{47 + i * 18}" class="l">{_E(l)} — {v} ({100 * v / tot:.0f}%)</text>')
+        off += ln
+    return "".join(s) + "</svg>"
+
+
+def svg_stack(title, labels, series, colors, w=560, h=230):
+    n = len(labels)
+    if not n or not series:
+        return f'<p class="mut">{_E(title)}: sin datos</p>'
+    tot = [sum(series[k][i] for k in series) for i in range(n)]
+    mx = max(tot + [1])
+    ch, bw = h - 70, (w - 40) / n
+    s = [f'<svg viewBox="0 0 {w} {h}" width="100%"><text x="0" y="16" class="t">{_E(title)}</text>']
+    for i in range(n):
+        y = 30 + ch
+        for k in series:
+            v = series[k][i]
+            if v:
+                hh = ch * v / mx
+                y -= hh
+                s.append(f'<rect x="{30 + i * bw:.1f}" y="{y:.1f}" width="{max(1.0, bw - 1):.1f}" height="{hh:.1f}" fill="{colors.get(k, "#999")}"/>')
+    s.append(f'<text x="30" y="{h - 34}" class="l">{_E(labels[0])}</text><text x="{w - 10}" y="{h - 34}" text-anchor="end" class="l">{_E(labels[-1])}</text>')
+    s.append(f'<text x="2" y="40" class="l">{mx}</text>')
+    for j, k in enumerate(series):
+        s.append(f'<rect x="{30 + (j % 5) * 105}" y="{h - 24 + (j // 5) * 14}" width="9" height="9" fill="{colors.get(k, "#999")}"/><text x="{43 + (j % 5) * 105}" y="{h - 16 + (j // 5) * 14}" class="l">{_E(k)}</text>')
+    return "".join(s) + "</svg>"
+
+
+def svg_line(title, labels, values, color="#e5484d", w=560, h=170):
+    if len(values) < 2:
+        return f'<p class="mut">{_E(title)}: aún sin histórico suficiente</p>'
+    mx = max(values + [1])
+    ch = h - 50
+    pts = " ".join(f"{30 + i * (w - 40) / (len(values) - 1):.1f},{30 + ch - ch * v / mx:.1f}" for i, v in enumerate(values))
+    return (f'<svg viewBox="0 0 {w} {h}" width="100%"><text x="0" y="16" class="t">{_E(title)}</text>'
+            f'<polyline points="{pts}" fill="none" stroke="{color}" stroke-width="2"/>'
+            f'<text x="30" y="{h - 8}" class="l">{_E(labels[0])}</text><text x="{w - 10}" y="{h - 8}" text-anchor="end" class="l">{_E(labels[-1])}</text>'
+            f'<text x="2" y="40" class="l">{mx}</text></svg>')
+
+
+def render_html(rep: Dict[str, Any]) -> str:
+    lvl_col = {"NORMAL": "#17c964", "VIGILANCIA": "#eab308", "ELEVADO": "#f97316", "CRÍTICO": "#e5484d"}.get(rep["level"], "#71717a")
+    tl = rep["timeline"]
+    h = [f"""<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Informe OSINT {rep['generated_at'][:16]}</title>
+<style>body{{font:14px/1.5 system-ui,sans-serif;max-width:980px;margin:0 auto;padding:20px;color:#1f2430;background:#fff}}
+h1{{font-size:22px;margin:0}}h2{{font-size:16px;border-bottom:2px solid #e5e7eb;padding-bottom:4px;margin-top:26px}}
+.banner{{background:{lvl_col};color:#fff;padding:14px 18px;border-radius:8px;margin:14px 0}}.banner b{{font-size:20px}}
+.kpis{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}}.kpi{{border:1px solid #e5e7eb;border-radius:8px;padding:10px;text-align:center}}
+.kpi .v{{font-size:24px;font-weight:700}}.kpi .k{{font-size:11px;color:#667;text-transform:uppercase}}
+table{{border-collapse:collapse;width:100%;font-size:12px}}th,td{{border:1px solid #e5e7eb;padding:4px 6px;text-align:left;vertical-align:top}}th{{background:#f4f5f7}}
+.mut{{color:#889;font-size:12px}}.t{{font:600 13px sans-serif;fill:#222}}.l{{font:11px sans-serif;fill:#444}}.grid{{display:grid;grid-template-columns:1fr 1fr;gap:14px}}
+.c-alta{{color:#0a8f4a;font-weight:700}}.c-media{{color:#c27800;font-weight:700}}.c-baja{{color:#888}}.cav li{{font-size:12px;color:#556}}
+@media print{{.grid{{grid-template-columns:1fr}}}}</style></head><body>
+<h1>Informe de situación — OSINT Early Warning v{_E(rep['version'])}</h1>
+<div class="mut">Generado {_E(rep['generated_at'])} UTC · ventana {rep['hours']:.0f} h · {rep['history_rows']} registros en histórico</div>
+<div class="banner"><b>{_E(rep['level'])}</b> — índice {rep['index']}/100 · tendencia {_E(rep['trend']['label'])}<br>{_E(rep['headline'])}</div>
+<div class="kpis">"""]
+    ip = rep["index_parts"]
+    for k, v in [("Alertas en vivo", rep["live_total"]), ("Críticas (30 min)", ip.get("critical_30m", 0)), ("Incidentes cruzados", len(rep["incidents"])),
+                 ("Posibles explosiones", len(rep["explosions"])), ("Comunicados", len(rep["statements"])), ("Telegram s/verificar", rep["telegram_unverified"])]:
+        h.append(f'<div class="kpi"><div class="v">{v}</div><div class="k">{_E(k)}</div></div>')
+    h.append("</div><h2>Hallazgos clave</h2><ul>" + "".join(f"<li>{_E(x)}</li>" for x in rep["findings"]) + "</ul>")
+    h.append("<h2>Incidentes con cruce de fuentes</h2>")
+    if rep["incidents"]:
+        h.append("<table><tr><th>Lugar</th><th>Confianza</th><th>Punt.</th><th>Indep.</th><th>Severidad</th><th>Primera–última (UTC)</th><th>Grupos</th><th>Fuentes</th></tr>")
+        for i in rep["incidents"]:
+            h.append(f"<tr><td>{_E(i['place'])}</td><td class='c-{i['conf']}'>{_E(i['conf'])}</td><td>{i['score']}</td><td>{i['independent']}</td>"
+                     f"<td>{_E(SEV_ES.get(i['severity'], i['severity']))}</td><td>{_E(i['first_seen'][11:16])}–{_E(i['last_seen'][11:16])}</td>"
+                     f"<td>{_E(', '.join(i['groups']))}</td><td>{_E(', '.join(i['sources'])[:200])}</td></tr>")
+        h.append("</table>")
+    else:
+        h.append('<p class="mut">Sin incidentes cruzados.</p>')
+    h.append('<h2>Gráficos</h2><div class="grid">')
+    h.append(svg_stack("Reportes por grupo en el tiempo", tl["labels"], tl["series"], GCOL))
+    h.append(svg_donut("Reportes por grupo", sorted(rep["by_group"].items(), key=lambda x: -x[1]), GCOL))
+    h.append(svg_donut("Severidad", [(k, rep["by_sev"].get(k, 0)) for k in ("critical", "high", "medium", "low")],
+                       {"critical": "#e5484d", "high": "#f97316", "medium": "#eab308", "low": "#2f6fed"}))
+    h.append(svg_donut("Credibilidad de la fuente (A oficial · B prensa/OSINT · C parte · D sin verificar)", [(k, rep["by_cred"].get(k, 0)) for k in "ABCD"],
+                       {"A": "#17c964", "B": "#2f6fed", "C": "#f97316", "D": "#71717a"}))
+    h.append(svg_hbar("Fuentes con más reportes", list(rep["by_source"].items()), "#2f6fed"))
+    reg = rep["regions"]
+    if reg.get("places"):
+        h.append(svg_hbar("Zonas con más reportes", sorted(zip(reg["places"], [sum(r) for r in reg["cells"]]), key=lambda x: -x[1]), "#f97316"))
+    ih = rep["index_history"]
+    h.append(svg_line("Índice de actividad (histórico)", [x["ts"][5:] for x in ih], [x["idx"] for x in ih]))
+    h.append("</div>")
+    if reg.get("places"):
+        h.append("<h2>Matriz zona × grupo</h2><table><tr><th>Zona</th>" + "".join(f"<th>{_E(g)}</th>" for g in reg["groups"]) + "</tr>")
+        mx = max([c for r in reg["cells"] for c in r] + [1])
+        for p, row in zip(reg["places"], reg["cells"]):
+            h.append(f"<tr><td>{_E(p)}</td>" + "".join(f"<td style='text-align:center;background:rgba(229,72,77,{0.08 + 0.7 * c / mx if c else 0:.2f})'>{c or ''}</td>" for c in row) + "</tr>")
+        h.append("</table>")
+    h.append("<h2>Comunicados oficiales</h2>")
+    if rep["statements"]:
+        h.append("<table><tr><th>Hora</th><th>Fuente</th><th>Cred.</th><th>Sev.</th><th>Texto</th></tr>" + "".join(
+            f"<tr><td>{_E(s['detected_at'][:16])}</td><td>{_E(s['source'])}</td><td>{_E(s['cred'])}</td><td>{_E(SEV_ES.get(s['severity'], ''))}</td>"
+            f"<td>{_E(s['description'])}{(' <a href=\"' + _E(s['link']) + '\">↗</a>') if str(s.get('link') or '').startswith('http') else ''}</td></tr>" for s in rep["statements"]) + "</table>")
+    else:
+        h.append('<p class="mut">Ninguno relevante.</p>')
+    h.append("<h2>Posibles explosiones sísmicas (heurístico)</h2>" + ("<ul>" + "".join(f"<li>{_E(e['detected_at'][:16])} — {_E(e['description'])}</li>" for e in rep["explosions"]) + "</ul>" if rep["explosions"] else '<p class="mut">Ninguna.</p>'))
+    h.append("<h2>Medios estatales (versión de parte, no verificada)</h2>" + ("<ul>" + "".join(f"<li><b>{_E(s['source'])}</b>: {_E(s['description'])}</li>" for s in rep["state_media"]) + "</ul>" if rep["state_media"] else '<p class="mut">Ninguno.</p>'))
+    if rep["watch_items"]:
+        h.append("<h2>Lista de vigilancia</h2><ul>" + "".join(f"<li>{_E(w['source'])}: {_E(w['description'])} <span class='mut'>({_E(', '.join(w['tags']))})</span></li>" for w in rep["watch_items"]) + "</ul>")
+    h.append("<h2>Estado de las fuentes</h2><table><tr><th>Fuente</th><th>Estado</th><th>Reportes</th><th>ms</th><th>Nota</th></tr>" + "".join(
+        f"<tr><td>{_E(s['name'])}</td><td>{_E(s['status'])}{' (desactivada)' if s['disabled'] else ''}</td><td>{s['count']}</td><td>{s['ms']}</td><td>{_E(s['error'])}</td></tr>" for s in rep["sources"]) + "</table>")
+    h.append("<h2>Avisos y metodología</h2><ul class='cav'>" + "".join(f"<li>{_E(c)}</li>" for c in CAVEATS) + "</ul></body></html>")
+    return "".join(h)
+
+
+def save_report(hours: float = 24.0) -> str:
+    rep = collect_report(hours)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    for ext, body in (("html", render_html(rep)), ("md", render_md(rep)), ("json", json.dumps(rep, ensure_ascii=False, indent=1, default=str))):
+        with open(os.path.join(REPORT_DIR, f"informe_{stamp}.{ext}"), "w", encoding="utf-8") as f:
+            f.write(body)
+    files = sorted(x for x in os.listdir(REPORT_DIR) if re.fullmatch(r"informe_\d{8}_\d{6}\.(html|md|json)", x))
+    for old in files[:-REPORT_KEEP * 3]:
+        try:
+            os.remove(os.path.join(REPORT_DIR, old))
+        except OSError:
+            pass
+    return stamp
+
+
+def _report_loop():
+    time.sleep(120)
+    while True:
+        try:
+            save_report(24)
+            log.info("Informe automático guardado")
+        except Exception as e:
+            log.warning(f"informe automático: {e}")
+        time.sleep(max(60.0, REPORT_INTERVAL_MIN * 60))
+
+
+# ------------------------------------------------------------
+# Exportaciones
+# ------------------------------------------------------------
+def incidents_csv(incs: List[dict]) -> str:
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["id", "place", "lat", "lon", "radius_km", "confidence", "score", "severity", "n_sources", "independent", "first_seen", "last_seen", "groups", "sources", "summary"])
+    for i in incs:
+        w.writerow([i["id"], i["place"], f"{i['lat']:.4f}", f"{i['lon']:.4f}", i["radius_km"], i["conf"], i["score"], i["severity"], i["n_sources"],
+                    i["independent"], i["first_seen"], i["last_seen"], "|".join(i["groups"]), "|".join(i["sources"]), i["summary"]])
+    return "\ufeff" + buf.getvalue()
+
+
+def geojson_of(snap: Dict[str, Any]) -> dict:
+    feats = []
+    for a in snap["alerts"]:
+        if hasgeo(a):
+            feats.append({"type": "Feature", "geometry": {"type": "Point", "coordinates": [float(a["lon"]), float(a["lat"])]},
+                          "properties": {"kind": "alert", "source": a["source"], "type": a.get("type"), "group": alert_group(a), "severity": a.get("severity"),
+                                         "cred": a.get("cred"), "detected_at": a.get("detected_at"), "description": a.get("description"),
+                                         "precise": is_precise(a), "incident_id": a.get("incident_id"), "link": a.get("link")}})
+    for i in snap["stats"].get("incidents", []):
+        feats.append({"type": "Feature", "geometry": {"type": "Point", "coordinates": [i["lon"], i["lat"]]},
+                      "properties": {"kind": "incident", **{k: i[k] for k in ("id", "place", "conf", "score", "severity", "n_sources", "independent", "first_seen", "last_seen", "summary", "radius_km")}}})
+    return {"type": "FeatureCollection", "features": feats}
+
+
+@app.route("/api/report")
+def v25_report():
+    fmt = request.args.get("format", "html").lower()
+    hours = request.args.get("hours", 24.0, type=float)
+    rep = collect_report(hours)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    if fmt == "json":
+        body, mt, ext = json.dumps(rep, ensure_ascii=False, indent=1, default=str), "application/json", "json"
+    elif fmt in ("md", "txt"):
+        body, mt, ext = render_md(rep), "text/plain", "md"
+    else:
+        body, mt, ext = render_html(rep), "text/html", "html"
+    hdr = {"Content-Disposition": f"attachment; filename=informe_{stamp}.{ext}"} if request.args.get("download") == "1" else {}
+    return Response(body, mimetype=mt, headers=hdr)
+
+
+@app.route("/api/report/generate", methods=["POST"])
+def v25_report_generate():
+    try:
+        return jsonify({"ok": True, "stamp": save_report(float((request.get_json(silent=True) or {}).get("hours", 24)))})
+    except Exception as e:
+        return jsonify({"error": str(e)[:200]}), 500
+
+
+@app.route("/api/reports")
+def v25_reports():
+    out: Dict[str, List[str]] = defaultdict(list)
+    if os.path.isdir(REPORT_DIR):
+        for x in sorted(os.listdir(REPORT_DIR), reverse=True):
+            m = re.fullmatch(r"informe_(\d{8}_\d{6})\.(html|md|json)", x)
+            if m:
+                out[m.group(1)].append(x)
+    return jsonify({"interval_min": REPORT_INTERVAL_MIN, "dir": REPORT_DIR, "reports": [{"stamp": k, "files": v} for k, v in list(out.items())[:40]]})
+
+
+@app.route("/api/reports/<fname>")
+def v25_report_file(fname):
+    if not re.fullmatch(r"informe_\d{8}_\d{6}\.(html|md|json)", fname):
+        return jsonify({"error": "Nombre no válido"}), 400
+    return send_from_directory(os.path.abspath(REPORT_DIR), fname, as_attachment=request.args.get("download") == "1")
+
+
+@app.route("/api/export/incidents.csv")
+def v25_export_incidents():
+    snap = live_snapshot()
+    return Response(incidents_csv(snap["stats"].get("incidents", [])), mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=incidentes.csv"})
+
+
+@app.route("/api/export/geojson")
+def v25_export_geojson():
+    return Response(json.dumps(geojson_of(live_snapshot()), ensure_ascii=False), mimetype="application/geo+json",
+                    headers={"Content-Disposition": "attachment; filename=alertas.geojson"})
+
+
+@app.route("/api/download/all")
+def v25_download_all():
+    hours = request.args.get("hours", 24.0, type=float)
+    snap = live_snapshot()
+    rep = collect_report(hours)
+    rows = base.query_history(hours=hours, limit=5000)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("informe.html", render_html(rep))
+        z.writestr("informe.md", render_md(rep))
+        z.writestr("informe.json", json.dumps(rep, ensure_ascii=False, indent=1, default=str))
+        z.writestr("alertas_en_vivo.json", json.dumps(snap["alerts"], ensure_ascii=False, default=str))
+        z.writestr("incidentes.csv", incidents_csv(snap["stats"].get("incidents", [])))
+        z.writestr("alertas.geojson", json.dumps(geojson_of(snap), ensure_ascii=False))
+        z.writestr("estado_fuentes.json", json.dumps(snap["stats"].get("source_status", {}), ensure_ascii=False, indent=1))
+        c = io.StringIO()
+        w = csv.writer(c)
+        cols = ["detected_at", "source", "type", "severity", "cred", "region", "lat", "lon", "description", "link"]
+        w.writerow(cols)
+        for r in rows:
+            w.writerow([r.get(k, "") for k in cols])
+        z.writestr("historial.csv", "\ufeff" + c.getvalue())
+        if base.LAST_DIAG.get("data"):
+            z.writestr("diagnostico_feeds.txt", base.diag_report_text(base.LAST_DIAG["data"]))
+        z.writestr("LEEME.txt", "Paquete generado por OSINT Early Warning v%s\n%s\n\n%s\n" % (VERSION, rep["generated_at"], "\n".join(CAVEATS)))
+    return Response(buf.getvalue(), mimetype="application/zip",
+                    headers={"Content-Disposition": f"attachment; filename=paquete_osint_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.zip"})
+
+
+@app.route("/api/analytics")
+def v25_analytics():
+    hours = max(1.0, min(request.args.get("hours", 24.0, type=float), 168.0))
+    rows = base.query_history(hours=hours, limit=5000)
+    return jsonify({"hours": hours, "group_timeline": hist_group_timeline(rows, hours),
+                    "by_group": dict(Counter(GROUP_OF_TYPE.get(r.get("type"), "Otros") for r in rows)),
+                    "by_cred": dict(Counter(r.get("cred", "D") for r in rows)),
+                    "by_source": dict(Counter(r["source"] for r in rows).most_common(8)),
+                    "index_history": index_history(hours)})
+
+
+@app.route("/api/notify/status")
+def v25_notify_status():
+    return jsonify({"webhook": bool(NOTIFY_WEBHOOK_URL), "ntfy": bool(NTFY_URL), "telegram": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+                    "report_interval_min": REPORT_INTERVAL_MIN})
+
+
+@app.route("/api/notify/test", methods=["POST"])
+def v25_notify_test():
+    sent = send_external("✅ Prueba de notificación — OSINT Monitor v" + VERSION)
+    return jsonify({"sent": sent}) if sent else (jsonify({"error": "Ningún canal configurado"}), 400)
+
+
+# ============================================================
+# 6) INTERFAZ (inyectada en el panel existente)
+# ============================================================
+EXTRA_UI = r"""
+<script>
+(function(){
+const st=document.createElement('style');
+st.textContent=`.tab{padding:10px 2px!important;font-size:9px!important}
+.mx{border-collapse:collapse;font-size:10px;width:100%}.mx td,.mx th{border:1px solid var(--border);padding:3px;text-align:center}.mx td:first-child,.mx th:first-child{text-align:left}
+.inc{border-left-color:var(--yellow)}details summary{cursor:pointer}
+.tag-vigilado{color:var(--red);border-color:var(--red)}
+.tt-h{font-weight:bold;margin-bottom:3px}.tt-m{opacity:.75;font-size:10px}.tt-b{margin:4px 0;line-height:1.35;word-break:break-word}.tt-x{margin-top:5px;border-top:1px solid #444;padding-top:4px}
+.chip{display:inline-block;border:1px solid var(--border);border-radius:10px;padding:1px 7px;margin:2px;font-size:10px}.chip span{cursor:pointer;color:var(--red);margin-left:4px}`;
+document.head.appendChild(st);
+const tabs=document.querySelector('.tabs'), side=document.querySelector('.sidebar');
+tabs.insertAdjacentHTML('beforeend','<div class="tab" data-tab="links">🔗 CRUCES</div><div class="tab" data-tab="report">📑 INFORME</div>');
+side.insertAdjacentHTML('beforeend',`
+<div class="content" id="tab-links">
+ <div class="frow" style="margin-bottom:10px"><select id="lkRange" class="fi" onchange="loadLinks()"><option value="6">6 h</option><option value="24" selected>24 h</option><option value="72">72 h</option><option value="168">7 d</option></select>
+ <button class="btn" style="flex:0 0 auto" onclick="loadLinks()">⟳</button></div>
+ <div class="kpis" id="lkKpis"></div>
+ <div class="chart-box"><h3>🔗 INCIDENTES CON CRUCE DE FUENTES</h3><div class="hint">Reportes de fuentes distintas cercanos en espacio y tiempo. «Independientes» no cuenta alertas del mismo sistema ni mensajes casi idénticos. Más cruce = más confianza, no certeza.</div><div id="lkList"></div></div>
+ <div class="chart-box"><h3>MATRIZ ZONA × GRUPO</h3><div id="lkMatrix"></div></div>
+ <div class="chart-box"><h3>RADAR — ACTIVIDAD POR GRUPO</h3><canvas id="chRadar"></canvas></div>
+ <div class="chart-box"><h3>ÁREA APILADA — GRUPOS EN EL TIEMPO</h3><canvas id="chGrpTL"></canvas></div>
+ <div class="chart-box"><h3>BURBUJAS — INCIDENTES (tiempo · fuentes indep. · puntuación)</h3><canvas id="chBubble"></canvas></div>
+ <div class="chart-box"><h3>POLAR — FUENTES CON MÁS REPORTES</h3><canvas id="chPolar"></canvas></div>
+ <div class="chart-box"><h3>DISPERSIÓN — SISMOS (profundidad vs magnitud)</h3><canvas id="chSeis"></canvas></div>
+ <div class="chart-box"><h3>HISTÓRICO DEL ÍNDICE DE ACTIVIDAD</h3><canvas id="chIdx"></canvas></div>
+</div>
+<div class="content" id="tab-report">
+ <div class="frow" style="margin-bottom:8px"><select id="rpRange" class="fi" onchange="repPreview()"><option value="6">Ventana 6 h</option><option value="12">12 h</option><option value="24" selected>24 h</option><option value="72">72 h</option><option value="168">7 d</option></select>
+ <button class="btn btn-blue" style="flex:0 0 auto" onclick="repPreview()">👁 VISTA PREVIA</button></div>
+ <div class="frow" style="margin-bottom:8px">
+ <button class="btn" onclick="location.href=repUrl('html',1)">⬇ HTML</button><button class="btn" onclick="location.href=repUrl('md',1)">⬇ MD</button><button class="btn" onclick="location.href=repUrl('json',1)">⬇ JSON</button>
+ <button class="btn" onclick="location.href='/api/export/incidents.csv'">⬇ INCIDENTES CSV</button><button class="btn" onclick="location.href='/api/export/geojson'">⬇ GEOJSON</button>
+ <button class="btn btn-orange" onclick="location.href='/api/download/all?hours='+document.getElementById('rpRange').value">📦 TODO (ZIP)</button>
+ <button class="btn" onclick="repSave()">💾 GUARDAR AHORA</button></div>
+ <iframe id="rpFrame" style="width:100%;height:460px;border:1px solid var(--border);background:#fff;border-radius:3px"></iframe>
+ <div class="chart-box" style="margin-top:10px"><h3>INFORMES AUTOMÁTICOS GUARDADOS</h3><div id="rpList" class="hint">Cargando...</div></div>
+ <div class="chart-box"><h3>👁 LISTA DE VIGILANCIA</h3><div class="hint">Palabras clave y zonas que quieres seguir. Las alertas que coincidan se marcan «vigilado» y se notifican.</div>
+ <div class="frow"><input id="wKw" class="fi" placeholder="palabra clave (ej. zaporizhzhia nuclear)"><button class="btn" style="flex:0 0 auto" onclick="wAddKw()">＋</button></div>
+ <div class="frow" style="margin-top:6px"><input id="wZn" class="fi" placeholder="zona" style="flex:2"><input id="wLa" class="fi" placeholder="lat" style="flex:1"><input id="wLo" class="fi" placeholder="lon" style="flex:1"><input id="wKm" class="fi" placeholder="km" value="150" style="flex:1"><button class="btn" style="flex:0 0 auto" onclick="wAddZone()">＋</button></div>
+ <div id="wList" style="margin-top:8px"></div></div>
+ <div class="chart-box"><h3>🔔 NOTIFICACIONES EXTERNAS</h3><div id="nStatus" class="hint"></div><button class="btn" onclick="nTest()">ENVIAR PRUEBA</button></div>
+</div>`);
+side.querySelector('#tab-search').insertAdjacentHTML('beforeend',`<div class="chart-box"><h3>GRUPOS DE CANALES</h3>
+ <div class="frow"><input id="gNew" class="fi" placeholder="nombre del nuevo grupo"><button class="btn" style="flex:0 0 auto" onclick="tgGroupCreate()">CREAR</button></div><div id="tgGroups" style="margin-top:8px"></div></div>`);
+document.querySelector('.map-controls').insertAdjacentHTML('beforeend','<button class="btn active" id="btnLinks" onclick="toggleLinks()" title="Mostrar cruces entre fuentes">CRUCES</button><button class="btn" id="btnHeat" onclick="toggleHeat()" title="Mapa de calor">CALOR</button>');
+tabs.querySelectorAll('.tab[data-tab="links"],.tab[data-tab="report"]').forEach(t=>t.addEventListener('click',()=>openTab(t.dataset.tab)));
+tabs.querySelector('.tab[data-tab="search"]').addEventListener('click',()=>{tgGroupsLoad();});
+})();
+
+const GRP_COLORS={'Alertas':'#ff3344','Sísmico':'#aa66ff','Satélite':'#ff8800','Naturales':'#00ccff','Prensa/OSINT':'#4488ff','Gobierno':'#00ff88','Estatal':'#ffcc00','Telegram':'#5ac8fa','Conflicto':'#ff66aa','Aviación':'#cccccc','Otros':'#666666'};
+const GRP_OF_TYPE={missile_alert:'Alertas',air_raid:'Alertas',kyiv_alert:'Alertas',drone_missile_track:'Alertas',earthquake:'Sísmico',seismic_explosion:'Sísmico',explosion_candidate:'Sísmico',nuclear_test_candidate:'Sísmico',thermal_anomaly:'Satélite',natural_event:'Naturales',disaster:'Naturales',news:'Prensa/OSINT',news_geo:'Prensa/OSINT',war_news:'Prensa/OSINT',official_statement:'Gobierno',state_media:'Estatal',telegram_signal:'Telegram',acled_conflict:'Conflicto',conflict_event:'Conflicto',flight_activity:'Aviación'};
+function grpOf(a){return a.group||GRP_OF_TYPE[a.type]||'Otros';}
+let lastStats={}, lastIncidents=[], lastPts=[], showLinks=true, showHeat=false, tgGroupsCache=[], incSig='', seenInc=new Set();
+
+function openTab(name){
+ document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.tab===name));
+ document.querySelectorAll('.content').forEach(x=>x.classList.toggle('active',x.id==='tab-'+name));
+ if(name==='links')loadLinks(); if(name==='report')initReportTab();
+}
+
+/* ---------- filtro por grupo ---------- */
+function ensureGrpSelect(){
+ let sel=document.getElementById('fGrp');
+ if(!sel){const row=document.getElementById('fCred').parentElement;sel=document.createElement('select');sel.id='fGrp';sel.className='fi';sel.onchange=onFilterChange;row.appendChild(sel);}
+ const cur=sel.value;
+ sel.innerHTML='<option value="">Grupo: todos</option><option value="__watch">★ Vigilados</option>'+Object.keys(GRP_COLORS).map(g=>`<option value="${esc(g)}">${esc(g)}</option>`).join('')+tgGroupsCache.map(g=>`<option value="tg:${esc(g.name)}">TG · ${esc(g.name)}</option>`).join('');
+ sel.value=cur;
+}
+function getVisible(){
+ const q=(document.getElementById('fSearch').value||'').trim().toLowerCase();
+ const sev=document.getElementById('fSev').value, src=document.getElementById('fSrc').value, typ=document.getElementById('fType').value, cred=document.getElementById('fCred').value;
+ const grp=(document.getElementById('fGrp')||{}).value||'';
+ return baseAlerts().filter(a=>(!sev||a.severity===sev)&&(!src||a.source===src)&&(!typ||typeGroup(a)===typ||(typ==='sismo'&&typeGroup(a)==='explosion'))&&(!cred||(a.cred||'D')===cred)
+  &&(!grp||(grp.indexOf('tg:')===0?(a.tags||[]).includes('grupo:'+grp.slice(3)):grp==='__watch'?(a.tags||[]).includes('vigilado'):grpOf(a)===grp))
+  &&(!q||((a.source||'')+' '+(a.description||'')+' '+(a.region||'')+' '+(a.type||'')+' '+(a.tags||[]).join(' ')).toLowerCase().includes(q)));
+}
+
+/* ---------- tooltip detallado ---------- */
+function ageTxt(iso){const s=(Date.now()-new Date(iso).getTime())/1000;if(!isFinite(s))return '';if(s<90)return 'hace '+Math.round(s)+' s';if(s<5400)return 'hace '+Math.round(s/60)+' min';if(s<172800)return 'hace '+(s/3600).toFixed(1)+' h';return 'hace '+Math.round(s/86400)+' d';}
+function detailHtml(a,near){
+ const cred=a.cred||'D', raw=a.raw||{}, tr=trCache.get(trKey(a.description||''));
+ let x='';
+ if(typeof raw.mag==='number')x+=`<div>Magnitud <b>M${raw.mag.toFixed(1)}</b>${raw.depth!=null?' · prof. '+Number(raw.depth).toFixed(0)+' km':''}</div>`;
+ if(raw.frp)x+=`<div>Potencia radiativa (FRP): <b>${Number(raw.frp).toFixed(0)} MW</b></div>`;
+ if(raw.count!=null&&a.type==='flight_activity')x+=`<div>Aeronaves en vuelo: <b>${esc(raw.count)}</b>${raw.median?' (mediana '+Number(raw.median).toFixed(0)+')':''}</div>`;
+ if(raw.views)x+=`<div>Vistas: ${esc(raw.views)} · canal @${esc(raw.channel||'')}</div>`;
+ if(raw.domain)x+=`<div>Medio: ${esc(raw.domain)}${raw.country?' · '+esc(raw.country):''}</div>`;
+ const tags=(a.tags||[]).map(t=>`<span class="sevtag tagw">${esc(t)}</span>`).join('');
+ const corr=a.incident_id?`<div class="tt-x">🔗 <b>Cruzado con ${a.corr_n} fuente(s) independiente(s)</b> · confianza <b>${esc(a.corr_conf)}</b><br><span style="opacity:.8">${esc((a.corr_sources||[]).join(' · '))}</span></div>`:'<div class="tt-x" style="opacity:.6">Sin cruce con otras fuentes cercanas en espacio/tiempo</div>';
+ const nr=(near&&near.length)?`<div class="tt-x" style="opacity:.85">＋ ${near.length} reporte(s) más en este punto: ${esc(near.slice(0,4).map(n=>n.source).join(' · '))}${near.length>4?'…':''}</div>`:'';
+ const geo=hasGeo(a)?`${Number(a.lat).toFixed(3)}, ${Number(a.lon).toFixed(3)}${a.geo_approx?' (aprox.)':''}`:'sin coordenadas';
+ return `<div class="tt-h">${esc(a.source)} <span class="credtag cred-${esc(cred)}">${esc(cred)}</span> <span class="sevtag">${esc(a.severity||'')}</span></div>
+ <div class="tt-m">${esc(grpOf(a))} · ${esc(a.type||'')} · ${esc(fmtDateTime(a.detected_at))} (${esc(ageTxt(a.detected_at))})</div>
+ <div class="tt-m">📍 ${esc(a.place||a.region||'')} · ${esc(geo)}</div>
+ <div class="tt-b">${esc(String(a.description||'').slice(0,600))}</div>
+ ${(tr&&tr.text&&!tr.same)?`<div class="tt-b" style="color:#00ff88">🌐 ${esc(tr.text.slice(0,500))}</div>`:''}${x}<div>${tags}</div>${corr}${nr}
+ ${safeUrl(a.link)?'<div class="tt-m" style="margin-top:4px">clic en el punto para abrir la ficha y el enlace de la fuente</div>':''}`;
+}
+function incidentHtml(i){
+ const col={alta:'#00ff88',media:'#ff8800',baja:'#888'}[i.conf];
+ return `<div class="tt-h">🔗 Incidente — ${esc(i.place)}</div><div class="tt-m">confianza <b style="color:${col}">${esc(i.conf)}</b> · puntuación ${i.score}/100 · severidad ${esc(i.severity)}</div>
+ <div class="tt-b">${esc(i.summary)}</div><div class="tt-m">Fuentes independientes ≈ ${i.independent} · radio ${i.radius_km} km</div>
+ <div class="tt-x">${i.members.slice(-6).map(m=>`<div>• <span class="credtag cred-${esc(m.cred)}">${esc(m.cred)}</span> ${esc(m.source)}: ${esc(String(m.description).slice(0,90))}</div>`).join('')}</div>`;
+}
+function popupCard(a,near){return `<div style="color:#111;font-family:'Courier New',monospace;font-size:11px;max-width:320px">${detailHtml(a,near)}${safeUrl(a.link)?`<a href="${esc(safeUrl(a.link))}" target="_blank" rel="noopener">abrir fuente ↗</a>`:''}</div>`;}
+function nearOf(obj){return lastPts.filter(p=>p!==obj&&Math.abs(p.coordinates[1]-obj.coordinates[1])<0.2&&Math.abs(p.coordinates[0]-obj.coordinates[0])<0.3).map(p=>p.a);}
+function tipFn(info){
+ const o=info&&info.object; if(!o)return null;
+ const html=o.kind==='incident'?incidentHtml(o.inc):detailHtml(o.a,nearOf(o));
+ return {html,style:{background:'#111',border:'1px solid #4488ff',color:'#e0e0e0',fontFamily:'Courier New,monospace',fontSize:'11px',maxWidth:'380px',whiteSpace:'normal',padding:'8px',borderRadius:'4px',zIndex:'1000'}};
+}
+function clickFn(info){
+ const o=info&&info.object; if(!o)return;
+ const html=o.kind==='incident'?incidentHtml(o.inc).replace(/color:#e0e0e0/g,''):popupCard(o.a,nearOf(o));
+ new maplibregl.Popup({closeButton:true,maxWidth:'360px'}).setLngLat(o.coordinates).setHTML(o.kind==='incident'?`<div style="color:#111;font-family:'Courier New',monospace;font-size:11px">${html}</div>`:html).addTo(map);
+}
+function updateMapFallback2(pts){
+ fbMarkers.forEach(m=>m.remove());fbMarkers=[];
+ pts.slice(0,500).forEach(p=>{
+  const a=p.a, el=document.createElement('div');
+  el.style.cssText='width:12px;height:12px;border-radius:50%;border:1px solid #000;cursor:pointer;background:'+(p.grp==='explosion'?'#aa66ff':sevCss(a.severity));
+  if(a.emoji){el.textContent=a.emoji;el.style.cssText='font-size:20px;line-height:20px;cursor:pointer;';}
+  const pop=new maplibregl.Popup({closeButton:false,offset:10,maxWidth:'340px'}).setHTML(popupCard(a,nearOf(p)));
+  el.addEventListener('mouseenter',()=>pop.setLngLat(p.coordinates).addTo(map));el.addEventListener('mouseleave',()=>pop.remove());
+  fbMarkers.push(new maplibregl.Marker({element:el}).setLngLat(p.coordinates).addTo(map));
+ });
+}
+function updateMap(){
+ if(!map)return; if(!mapReady){mapPending=true;return;}
+ const pts=getVisible().filter(hasGeo).map(a=>({kind:'alert',coordinates:[Number(a.lon),Number(a.lat)],a,grp:typeGroup(a)}));
+ lastPts=pts; initOverlay();
+ if(!overlay){updateMapFallback2(pts);return;}
+ const layers=[];
+ if(showHeat&&deck.HeatmapLayer)layers.push(new deck.HeatmapLayer({id:'heat',data:pts,getPosition:d=>d.coordinates,getWeight:d=>({critical:4,high:2.5,medium:1.2,low:.5}[d.a.severity]||.5),radiusPixels:45,intensity:1.4,threshold:0.05}));
+ if(showLinks&&lastIncidents.length){
+  const links=[],incPts=lastIncidents.map(i=>({kind:'incident',coordinates:[i.lon,i.lat],inc:i}));
+  lastIncidents.forEach(i=>i.members.forEach(m=>links.push({from:[i.lon,i.lat],to:[m.lon,m.lat],conf:i.conf})));
+  if(deck.LineLayer)layers.push(new deck.LineLayer({id:'links',data:links,getSourcePosition:d=>d.from,getTargetPosition:d=>d.to,getColor:[255,204,0,150],getWidth:1.5,widthUnits:'pixels'}));
+  layers.push(new deck.ScatterplotLayer({id:'inc',data:incPts,getPosition:d=>d.coordinates,getRadius:d=>Math.max(30000,d.inc.radius_km*1000+20000),stroked:true,filled:false,
+   getLineColor:d=>d.inc.conf==='alta'?[0,255,136,230]:d.inc.conf==='media'?[255,136,0,230]:[160,160,160,200],lineWidthMinPixels:2,radiusMinPixels:16,radiusMaxPixels:70,pickable:true}));
+ }
+ layers.push(new deck.ScatterplotLayer({id:'alerts',data:pts,getPosition:d=>d.coordinates,getRadius:d=>d.a.severity==='critical'?150000:80000,
+  getFillColor:d=>d.grp==='explosion'?[170,102,255,230]:d.a.severity==='critical'?[255,51,68,220]:d.a.severity==='high'?[255,136,0,200]:[0,255,136,180],
+  radiusMinPixels:5,radiusMaxPixels:30,pickable:true,autoHighlight:true,highlightColor:[255,255,255,120]}));
+ if(deck.TextLayer)layers.push(new deck.TextLayer({id:'emoji',data:pts.filter(p=>p.a.emoji),getPosition:d=>d.coordinates,getText:d=>d.a.emoji,getSize:22,sizeUnits:'pixels',getTextAnchor:'middle',getAlignmentBaseline:'center',pickable:false,fontFamily:'Apple Color Emoji, Segoe UI Emoji, Noto Color Emoji, sans-serif',characterSet:'auto'}));
+ overlay.setProps({layers,getTooltip:tipFn,onClick:clickFn,pickingRadius:8});
+}
+function toggleLinks(){showLinks=!showLinks;document.getElementById('btnLinks').classList.toggle('active',showLinks);updateMap();}
+function toggleHeat(){showHeat=!showHeat;document.getElementById('btnHeat').classList.toggle('active',showHeat);updateMap();}
+
+/* ---------- hook de estadísticas ---------- */
+const _renderSummary0=renderSummary;
+renderSummary=function(stats){
+ _renderSummary0(stats); lastStats=stats||{}; lastIncidents=lastStats.incidents||[];
+ const sig=lastIncidents.map(i=>i.id+i.n_alerts).join(',');
+ if(sig!==incSig){incSig=sig;updateMap();}
+ lastIncidents.forEach(i=>{if(!seenInc.has(i.id)){seenInc.add(i.id);if((i.conf==='alta'||i.conf==='media')&&(i.severity==='high'||i.severity==='critical'))notify('🔗 Incidente cruzado ['+i.conf+']',i.summary);}});
+ ensureGrpSelect();
+ if(document.getElementById('tab-links').classList.contains('active'))renderLinks();
+};
+
+/* ---------- pestaña CRUCES ---------- */
+function incCard(i,idx){
+ const col={alta:'var(--green)',media:'var(--orange)',baja:'#888'}[i.conf];
+ return `<div class="alert-item inc" style="border-left-color:${col}" onclick="flyInc(${idx})"><span class="src">🔗 ${esc(i.place)}</span><span class="sevtag">${esc(i.severity)}</span>
+ <span class="sevtag" style="color:${col};border-color:${col}">confianza ${esc(i.conf)} · ${i.score}</span><span class="time">${esc(fmtTime(i.last_seen))}</span>
+ <div class="desc">${esc(i.summary)}</div><div class="desc" style="color:var(--dim)">Independientes≈${i.independent} · ${esc(i.sources.join(', '))}</div>
+ <details onclick="event.stopPropagation()"><summary class="hint">ver ${i.members.length} reportes</summary>${i.members.map(m=>`<div class="tg-msg"><span class="tm">${esc(fmtTime(m.detected_at))}</span> <span class="credtag cred-${esc(m.cred)}">${esc(m.cred)}</span> <b>${esc(m.source)}</b> — ${esc(m.description)}${safeUrl(m.link)?` <a class="lnk" href="${esc(safeUrl(m.link))}" target="_blank" rel="noopener">↗</a>`:''}</div>`).join('')}</details></div>`;
+}
+function flyInc(i){const x=lastIncidents[i];if(x)map.flyTo({center:[x.lon,x.lat],zoom:7,duration:900});}
+function renderLinks(){
+ const inc=lastIncidents, s=lastStats||{};
+ const alta=inc.filter(i=>i.conf==='alta').length, ind=inc.length?(inc.reduce((a,i)=>a+i.independent,0)/inc.length).toFixed(1):'0';
+ document.getElementById('lkKpis').innerHTML=[['Incidentes',inc.length,'var(--text)'],['Confianza alta',alta,'var(--green)'],['Indep. media',ind,'var(--blue)'],['Índice',(s.index||0)+'/100','var(--orange)'],['Nivel',s.level||'—','var(--yellow)'],['Vigilados',s.watch_hits||0,'var(--red)']].map(([l,v,c])=>`<div class="kpi"><div class="kv" style="color:${c};font-size:${String(v).length>6?13:22}px">${esc(v)}</div><div class="kl">${esc(l)}</div></div>`).join('');
+ document.getElementById('lkList').innerHTML=inc.length?inc.map(incCard).join(''):'<div class="hint">Sin cruces en la ventana actual.</div>';
+ const m=s.matrix;
+ if(!m||!m.places||!m.places.length)document.getElementById('lkMatrix').innerHTML='<div class="hint">Sin datos geolocalizados</div>';
+ else{const mx=Math.max(1,...m.cells.flat());
+  document.getElementById('lkMatrix').innerHTML='<table class="mx"><tr><th>Zona</th>'+m.groups.map(g=>`<th>${esc(g.slice(0,8))}</th>`).join('')+'</tr>'+m.places.map((p,r)=>`<tr><td>${esc(p)}</td>${m.cells[r].map(c=>`<td style="background:rgba(255,51,68,${c?(0.12+0.7*c/mx).toFixed(2):0})">${c||''}</td>`).join('')}</tr>`).join('')+'</table>';}
+ const live=s.by_group||{}, gk=Object.keys(live);
+ mkChart('chRadar',{type:'radar',data:{labels:gk,datasets:[{label:'Alertas en vivo',data:gk.map(k=>live[k]),backgroundColor:'rgba(255,51,68,.25)',borderColor:'#ff3344',pointBackgroundColor:'#ff3344'}]},
+  options:{responsive:true,plugins:{legend:{labels:{color:'#aaa',font:{size:10}}}},scales:{r:{ticks:{color:'#888',backdropColor:'transparent'},grid:{color:'#333'},angleLines:{color:'#333'},pointLabels:{color:'#aaa',font:{size:9}}}}}});
+ mkChart('chBubble',{type:'bubble',data:{datasets:['alta','media','baja'].map(cf=>({label:cf,backgroundColor:{alta:'rgba(0,255,136,.55)',media:'rgba(255,136,0,.55)',baja:'rgba(150,150,150,.5)'}[cf],
+   data:inc.filter(i=>i.conf===cf).map(i=>({x:-(Date.now()-new Date(i.last_seen).getTime())/3600000,y:i.independent,r:Math.max(5,i.score/6),l:i.place+' · '+i.score+' pts'}))}))},
+  options:{responsive:true,plugins:{legend:{labels:{color:'#aaa',font:{size:10}}},tooltip:{callbacks:{label:c=>c.raw.l}}},scales:{x:Object.assign({title:{display:true,text:'horas (0 = ahora)',color:'#888'}},AX),y:Object.assign({beginAtZero:true,title:{display:true,text:'fuentes indep.',color:'#888'}},AX)}}});
+ const sp=s.seismic_points||[], cls={earthquake:'#4488ff',explosion_candidate:'#aa66ff',seismic_explosion:'#ff3344',nuclear_test_candidate:'#ff3344'};
+ mkChart('chSeis',{type:'scatter',data:{datasets:Object.keys(cls).map(t=>({label:t,backgroundColor:cls[t],data:sp.filter(p=>p.type===t&&p.depth!=null).map(p=>({x:Number(p.depth),y:Number(p.mag)}))}))},
+  options:{responsive:true,plugins:{legend:{labels:{color:'#aaa',font:{size:10}}}},scales:{x:Object.assign({title:{display:true,text:'profundidad (km)',color:'#888'}},AX),y:Object.assign({title:{display:true,text:'magnitud',color:'#888'}},AX)}}});
+}
+async function loadLinks(){
+ renderLinks();
+ try{
+  const r=await fetch('/api/analytics?hours='+(document.getElementById('lkRange').value||24)); const j=await r.json(); if(!r.ok)throw new Error(j.error||r.status);
+  const tl=j.group_timeline||{labels:[],series:{}};
+  mkChart('chGrpTL',{type:'line',data:{labels:tl.labels,datasets:Object.keys(tl.series).map(g=>({label:g,data:tl.series[g],fill:true,borderColor:GRP_COLORS[g]||'#888',backgroundColor:(GRP_COLORS[g]||'#888')+'66',tension:.3,pointRadius:0}))},
+   options:{responsive:true,plugins:{legend:{labels:{color:'#aaa',font:{size:9}}}},scales:{x:Object.assign({},AX,{ticks:{color:'#888',font:{size:9},maxTicksLimit:6}}),y:Object.assign({stacked:true,beginAtZero:true},AX)}}});
+  const bs=Object.entries(j.by_source||{});
+  mkChart('chPolar',{type:'polarArea',data:{labels:bs.map(x=>x[0]),datasets:[{data:bs.map(x=>x[1]),backgroundColor:['#ff3344aa','#ff8800aa','#4488ffaa','#00ff88aa','#aa66ffaa','#ffcc00aa','#00ccffaa','#ff66aaaa']}]},
+   options:{responsive:true,plugins:{legend:{position:'right',labels:{color:'#aaa',font:{size:9}}}},scales:{r:{ticks:{color:'#888',backdropColor:'transparent'},grid:{color:'#333'}}}}});
+  const ih=j.index_history||[];
+  mkChart('chIdx',{type:'line',data:{labels:ih.map(x=>x.ts.slice(5).replace('T',' ')),datasets:[{label:'Índice',data:ih.map(x=>x.idx),borderColor:'#ff3344',backgroundColor:'#ff334455',fill:true,tension:.3,pointRadius:0},{label:'Incidentes',data:ih.map(x=>x.incidents),borderColor:'#ffcc00',tension:.3,pointRadius:0}]},
+   options:{responsive:true,plugins:{legend:{labels:{color:'#aaa',font:{size:10}}}},scales:{x:Object.assign({},AX,{ticks:{color:'#888',font:{size:9},maxTicksLimit:6}}),y:Object.assign({beginAtZero:true},AX)}}});
+ }catch(e){toast('Análisis: '+e.message);}
+}
+setInterval(()=>{if(document.getElementById('tab-links').classList.contains('active'))loadLinks();},45000);
+
+/* ---------- pestaña INFORME ---------- */
+function repUrl(fmt,dl){return '/api/report?format='+fmt+'&hours='+document.getElementById('rpRange').value+(dl?'&download=1':'');}
+function repPreview(){document.getElementById('rpFrame').src=repUrl('html');}
+async function repSave(){try{const r=await fetch('/api/report/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hours:Number(document.getElementById('rpRange').value)})});const j=await r.json();if(!r.ok)throw new Error(j.error);toast('Informe guardado: '+j.stamp);loadReports();}catch(e){toast('Error: '+e.message);}}
+async function loadReports(){
+ try{const j=await (await fetch('/api/reports')).json();
+  document.getElementById('rpList').innerHTML=(j.interval_min>0?`Auto-informe cada ${j.interval_min} min en <code>${esc(j.dir)}/</code><br>`:'Auto-informe desactivado<br>')+((j.reports||[]).map(r=>`<div class="st-row"><span class="nm">${esc(r.stamp)}</span>${r.files.map(f=>`<a class="btn" href="/api/reports/${esc(f)}?download=1">${esc(f.split('.').pop().toUpperCase())}</a>`).join('')}</div>`).join('')||'Aún no hay informes guardados (el primero se genera a los 2 min).');
+ }catch(e){document.getElementById('rpList').textContent=e.message;}
+}
+async function loadWatch(){
+ try{const w=await (await fetch('/api/watchlist')).json();
+  document.getElementById('wList').innerHTML=(w.keywords||[]).map(k=>`<span class="chip">🔎 ${esc(k)}<span data-k="${esc(k)}" onclick="wDel('keyword',this.dataset.k)">✕</span></span>`).join('')+(w.zones||[]).map(z=>`<span class="chip">📍 ${esc(z.name)} (${esc(z.radius_km)} km)<span data-k="${esc(z.name)}" onclick="wDel('zone',this.dataset.k)">✕</span></span>`).join('')||'<span class="hint">Vacía</span>';
+ }catch(e){}
+}
+async function wPost(b){const r=await fetch('/api/watchlist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});const j=await r.json();if(!r.ok)toast(j.error||'Error');else{loadWatch();loadData(true);}}
+function wAddKw(){const v=document.getElementById('wKw').value.trim();if(v){wPost({keyword:v});document.getElementById('wKw').value='';}}
+function wAddZone(){wPost({zone:{name:document.getElementById('wZn').value,lat:document.getElementById('wLa').value,lon:document.getElementById('wLo').value,radius_km:document.getElementById('wKm').value}});}
+async function wDel(kind,v){await fetch('/api/watchlist?'+kind+'='+encodeURIComponent(v),{method:'DELETE'});loadWatch();loadData(true);}
+async function loadNotify(){try{const j=await (await fetch('/api/notify/status')).json();document.getElementById('nStatus').innerHTML=`Webhook: ${j.webhook?'✅':'—'} · ntfy: ${j.ntfy?'✅':'—'} · Telegram bot: ${j.telegram?'✅':'—'}<br>Se envía: incidentes cruzados (confianza alta/media), comunicados graves, explosiones correlacionadas y coincidencias de vigilancia. Configúralo con NOTIFY_WEBHOOK_URL, NTFY_URL o TELEGRAM_BOT_TOKEN+TELEGRAM_CHAT_ID.`;}catch(e){}}
+async function nTest(){const r=await fetch('/api/notify/test',{method:'POST'});const j=await r.json();toast(r.ok?'Enviado a: '+j.sent.join(', '):(j.error||'Error'));}
+function initReportTab(){repPreview();loadReports();loadWatch();loadNotify();}
+
+/* ---------- grupos de Telegram ---------- */
+async function tgGroupsLoad(){
+ try{const j=await (await fetch('/api/telegram/groups')).json();tgGroupsCache=j.groups||[];ensureGrpSelect();
+  document.getElementById('tgGroups').innerHTML=tgGroupsCache.map((g,i)=>`<div class="st-row" style="flex-wrap:wrap"><span class="dot" style="background:${g.enabled?'var(--green)':(g.active?'var(--orange)':'var(--dim)')}"></span>
+  <span class="nm"><b>${esc(g.name)}</b> <span class="meta">${g.active}/${g.members.length} activos</span></span>
+  <button class="btn" data-g="${esc(g.name)}" data-e="${g.enabled?0:1}" onclick="tgGroupToggle(this.dataset.g,this.dataset.e==='1')">${g.enabled?'DESACTIVAR':'ACTIVAR'} TODO</button>
+  <button class="btn btn-red" data-g="${esc(g.name)}" onclick="tgGroupDelete(this.dataset.g)">✕</button></div>
+  <div>${g.members.map(m=>`<span class="chip" title="${esc(m.name)}" style="${m.enabled?'':'opacity:.5'}">@${esc(m.id)}<span data-g="${esc(g.name)}" data-u="${esc(m.id)}" onclick="tgGroupEdit(this.dataset.g,[],[this.dataset.u])">✕</span></span>`).join('')}</div>
+  <div class="frow" style="margin:4px 0 10px"><input id="gadd-${i}" class="fi" placeholder="@canal para añadir al grupo"><button class="btn" style="flex:0 0 auto" data-g="${esc(g.name)}" data-i="${i}" onclick="tgGroupEdit(this.dataset.g,[document.getElementById('gadd-'+this.dataset.i).value],[])">＋</button></div>`).join('')||'<div class="hint">Sin grupos</div>';
+ }catch(e){}
+}
+async function tgGroupEdit(name,add,remove){
+ const r=await fetch('/api/telegram/groups',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,add:add.filter(Boolean),remove})});const j=await r.json();
+ if(!r.ok)toast(j.error||'Error');else if((j.warnings||[]).length)toast(j.warnings.join('; '));
+ tgGroupsLoad();tgLoadChannels();loadData(true);
+}
+function tgGroupCreate(){const n=document.getElementById('gNew').value.trim();if(n){tgGroupEdit(n,[],[]);document.getElementById('gNew').value='';}}
+async function tgGroupToggle(name,enabled){await fetch('/api/telegram/groups/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,enabled})});toast((enabled?'Activado: ':'Desactivado: ')+name);tgGroupsLoad();tgLoadChannels();loadData(true);}
+async function tgGroupDelete(name){if(!confirm('¿Borrar el grupo «'+name+'»? (los canales siguen monitorizados)'))return;await fetch('/api/telegram/groups/'+encodeURIComponent(name),{method:'DELETE'});tgGroupsLoad();}
+window.addEventListener('DOMContentLoaded',()=>{ensureGrpSelect();tgGroupsLoad();});
+</script>
+"""
+
+if "</body>" in base.HTML_PANEL:
+    base.HTML_PANEL = base.HTML_PANEL.replace("</body>", EXTRA_UI + "</body>", 1)
+else:
+    log.warning("No se encontró </body> en el panel base: la interfaz v2.5 no se inyectó")
+
+
+# ============================================================
+# ARRANQUE
+# ============================================================
 if __name__ == "__main__":
     if "--tg-login" in sys.argv:
-        tg_login_cli()
+        base.tg_login_cli()
         sys.exit(0)
-    init_db()
-    keyed = {
-        "NASA FIRMS": NASA_FIRMS_KEY != "TU_MAP_KEY_AQUI",
-        "GDELT Cloud": GDELT_API_KEY != "TU_GDELT_KEY_AQUI",
-        "World Monitor": WORLD_MONITOR_KEY != "TU_WM_KEY_AQUI",
-        "alerts.in.ua": bool(ALERTS_UA_TOKEN),
-    }
-    port = find_free_port(HOST, PORT)
-    if port != PORT:
-        print(f"  [!] Puerto {PORT} ocupado -> usando automáticamente el puerto {port}")
-    print("=" * 60)
-    print(f"  GLOBAL EARLY WARNING OSINT — v{APP_VERSION}")
-    print(f"  http://{HOST}:{port}")
-    print("  Fuentes públicas (sin API): Tzeva Adom, Oref, alerts.com.ua,")
-    print("    Ubilling UA, Kyiv Digital, Neptun, sismos (USGS + EMSC + GEOFON), NASA EONET,")
-    print("    GDELT GEO, RSS noticias, prensa/OSINT de guerra, comunicados oficiales, medios estatales, Telegram")
-    print("  Traductor: " + ", ".join(n for n, _ in translation_providers()))
-    print("  Con API: " + ", ".join(f"{k} [{'ON' if v else 'off'}]" for k, v in keyed.items()))
-    print("  Telethon: " + ("listo" if (TELETHON_OK and TG_API_ID and TG_API_HASH) else "no configurado (búsqueda por web)"))
-    print("=" * 60)
-    threading.Thread(target=_startup_diag, daemon=True).start()
-    # Si otro programa toma el puerto entre la comprobación y el arranque, reintenta con el siguiente
-    for attempt in range(10):
+    base.init_db()
+    init_v25_db()
+    port = base.find_free_port(base.HOST, base.PORT)
+    if port != base.PORT:
+        print(f"  [!] Puerto {base.PORT} ocupado -> usando el puerto {port}")
+    print("=" * 62)
+    print(f"  GLOBAL EARLY WARNING OSINT — v{VERSION}  (sobre {BASE_MODULE}.py)")
+    print(f"  http://{base.HOST}:{port}")
+    print(f"  Fuentes: {len(base.SOURCES)} módulos · feeds RSS {len(base.RSS_FEEDS)} · guerra {len(base.WAR_FEEDS)} · "
+          f"comunicados {len(base.STATEMENT_FEEDS)} · estatales {len(base.STATE_MEDIA_FEEDS)} · Telegram {len(base.TELEGRAM_CHANNELS)}")
+    print("  Informe automático: " + (f"cada {REPORT_INTERVAL_MIN:g} min en ./{REPORT_DIR}" if REPORT_INTERVAL_MIN > 0 else "desactivado"))
+    print("  Notificaciones externas: " + (", ".join(n for n, ok in (("webhook", NOTIFY_WEBHOOK_URL), ("ntfy", NTFY_URL), ("telegram", TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)) if ok) or "no configuradas"))
+    print("=" * 62)
+    threading.Thread(target=base._startup_diag, daemon=True).start()
+    if REPORT_INTERVAL_MIN > 0:
+        threading.Thread(target=_report_loop, daemon=True).start()
+    for _attempt in range(10):
         try:
-            app.run(host=HOST, port=port, debug=False, threaded=True)
+            app.run(host=base.HOST, port=port, debug=False, threaded=True)
             break
         except OSError as e:
             print(f"  [!] No se pudo usar el puerto {port} ({e}); probando otro...")
-            port = find_free_port(HOST, port + 1)
-            print(f"  http://{HOST}:{port}")
+            port = base.find_free_port(base.HOST, port + 1)
+            print(f"  http://{base.HOST}:{port}")
