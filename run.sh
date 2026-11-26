@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# SentinelMar / GEWOM v2.4 — Lanzador
+# GLOBAL EARLY WARNING OSINT MONITOR (GEWOM) v2.4 — Lanzador
 # ============================================================
 
 set -euo pipefail
@@ -24,18 +24,10 @@ if [ -f ".env" ]; then
     set +a
 fi
 
-MAIN=""
-for f in SentinelMar.py GEWOM.py sentinelmar.py; do
-    if [ -f "$f" ]; then
-        MAIN="$f"
-        break
-    fi
-done
-
-if [ -z "$MAIN" ]; then
-    echo "[ERR] No se encontró SentinelMar.py (ni GEWOM.py)."
+if [ ! -f "GEWOM.py" ]; then
+    echo "[ERR] No se encontró GEWOM.py en $(pwd)" >&2
     exit 1
 fi
 
-echo "▶ Arrancando $MAIN ..."
-exec python "$MAIN" "$@"
+echo "▶ Arrancando GEWOM.py ..."
+exec python GEWOM.py "$@"
