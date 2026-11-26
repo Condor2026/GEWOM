@@ -1,6 +1,7 @@
+
 #!/usr/bin/env bash
 # ============================================================
-# SentinelMar / GEWOM v2.4 — Instalador
+# GLOBAL EARLY WARNING OSINT MONITOR (GEWOM) v2.4 — Instalador
 # ============================================================
 
 set -euo pipefail
@@ -90,8 +91,8 @@ echo "  Arrancar:"
 echo -e "    ${YELLOW}./run.sh${NC}"
 echo ""
 echo "  O manualmente:"
-echo -e "    ${YELLOW}source venv/bin/activate && python SentinelMar.py${NC}"
+echo -e "    ${YELLOW}source venv/bin/activate && python GEWOM.py${NC}"
 echo ""
-echo "  Abrí en el navegador:"
+echo "  Abrir en el navegador:"
 echo -e "    ${BLUE}http://127.0.0.1:5000${NC}"
 echo ""
