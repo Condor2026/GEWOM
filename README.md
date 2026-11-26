@@ -84,7 +84,7 @@ Servidor local en `http://127.0.0.1:5000` con dashboard web y API JSON.
 
 ```bash
 git clone https://github.com/Condor2026/GEWOM
-cd GEWOM.py
+cd GEWOM
 chmod +x install.sh
 ./install.sh
 nano .env      # opcional: claves API
