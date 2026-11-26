@@ -1,5 +1,5 @@
 # ============================================================
-# GLOBAL EARLY WARNING OSINT MONITOR — v2.4
+# GEWOM — Global Early Warning Monitor — v2.6 (archivo único)
 # -By: Condor2026
 # Fuentes (sin API / públicas): Tzeva Adom, Oref (oficial), alerts.com.ua,
 #          Ubilling UA, Kyiv Digital, Neptun, USGS, NASA EONET,
@@ -2787,7 +2787,7 @@ HTML_PANEL = r"""
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>GLOBAL EARLY WARNING OSINT</title>
+<title>GEWOM — Global Early Warning</title>
 <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
 <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
 <script src="https://unpkg.com/deck.gl@9.0.0/dist.min.js"></script>
@@ -2897,7 +2897,7 @@ select.fi { flex: 1 1 30%; }
 <div class="alert-banner" id="alertBanner">⚠ ALERTA ACTIVA — MISIL / DRON DETECTADO ⚠</div>
 <div class="alert-banner stmt" id="stmtBanner" onclick="openStatements()" title="Ver comunicados oficiales"></div>
 <div class="header">
-<h1>▶ GLOBAL EARLY WARNING OSINT</h1>
+<h1>▶ GEWOM — GLOBAL EARLY WARNING</h1>
 <div class="status">
 <span><span class="dot live" id="statusDot"></span><span id="statusText">INIT</span></span>
 <span class="badge total" id="badgeTotal">0 alertas</span>
@@ -3803,7 +3803,7 @@ init_db()
 # ===== EXTENSIÓN v2.5 =====
 # -*- coding: utf-8 -*-
 # ============================================================
-# GLOBAL EARLY WARNING OSINT MONITOR — v2.5 (extensión sobre v2.4, sin tocar el original)
+# GEWOM — módulo v2.5 integrado
 #
 # USO:
 #   1) Guarda tu script v2.4 como  osint_monitor.py  (o define OSINT_BASE_MODULE=nombre_sin_.py)
@@ -3849,6 +3849,7 @@ BASE_MODULE = "GEWOM"
 base = sys.modules[__name__]
 
 from flask import jsonify, request, Response, send_from_directory
+from urllib.parse import urlparse
 
 app = base.app
 log = logging.getLogger("v25")
@@ -4463,10 +4464,11 @@ def _tok(s: str) -> set:
     return {w for w in re.findall(r"[^\W\d_]{4,}", (s or "").lower()) if w not in base._STOPWORDS}
 
 
-def build_incidents(alerts: List[dict]) -> List[dict]:
-    cands = [a for a in alerts if a.get("type") in CORR_TYPES and is_precise(a) and _age(a) <= CORR_WINDOW_H * 3600]
-    cands.sort(key=lambda a: a.get("detected_at", ""), reverse=True)
-    cands = cands[:900]
+def build_incidents(alerts: List[dict], window_h: Optional[float] = None, max_n: int = 900, keep: bool = False) -> List[dict]:
+    win = (window_h or CORR_WINDOW_H) * 3600
+    cands = [a for a in alerts if a.get("type") in CORR_TYPES and is_precise(a) and _age(a) <= win]
+    cands.sort(key=lambda a: base.epoch_of(a.get("detected_at", "")), reverse=True)
+    cands = cands[:max_n]
     n = len(cands)
     parent = list(range(n))
 
@@ -4481,7 +4483,9 @@ def build_incidents(alerts: List[dict]) -> List[dict]:
     lo = [float(a["lon"]) for a in cands]
     for i in range(n):
         for j in range(i + 1, n):
-            if abs(ts[i] - ts[j]) > CLUSTER_MIN * 60 or abs(la[i] - la[j]) * 111.0 > CLUSTER_KM:
+            if ts[i] - ts[j] > CLUSTER_MIN * 60:
+                break  # ordenado por tiempo descendente: el resto es aún más antiguo
+            if abs(la[i] - la[j]) * 111.0 > CLUSTER_KM:
                 continue
             if base.haversine_km(la[i], lo[i], la[j], lo[j]) <= CLUSTER_KM:
                 parent[find(i)] = find(j)
@@ -4548,6 +4552,8 @@ def build_incidents(alerts: List[dict]) -> List[dict]:
         }
         for m in mem:
             m["incident_id"], m["corr_n"], m["corr_conf"], m["corr_sources"] = iid, len(fams) - 1, conf, srcs[:6]
+        if keep:
+            inc["_mem"] = mem
         incidents.append(inc)
     rank = {"alta": 2, "media": 1, "baja": 0}
     incidents.sort(key=lambda i: (rank[i["conf"]], i["score"], i["last_seen"]), reverse=True)
@@ -4712,12 +4718,23 @@ def fetch_all_v25() -> Dict[str, Any]:
             if a.get("type") == "telegram_signal":
                 for g in tgmap.get(str((a.get("raw") or {}).get("channel", "")).lower(), []):
                     a["tags"].append(f"grupo:{g}")
-        watch_hits = apply_watch(alerts)
-        incidents = build_incidents(alerts)
-        idx, parts = activity_index(alerts)
+        for h in PRE_HOOKS:
+            try:
+                h(alerts)
+            except Exception as e:
+                log.warning(f"pre-hook: {e}")
+        active = [a for a in alerts if not a.get("excluded")]
+        watch_hits = apply_watch(active)
+        incidents = build_incidents(active)
+        idx, parts = activity_index(active)
         stats["incidents"] = incidents
-        stats["matrix"] = build_matrix(alerts)
-        stats["by_group"] = dict(Counter(a["group"] for a in alerts))
+        stats["matrix"] = build_matrix(active)
+        stats["by_group"] = dict(Counter(a["group"] for a in active))
+        for h in POST_HOOKS:
+            try:
+                h(alerts, stats, incidents)
+            except Exception as e:
+                log.warning(f"post-hook: {e}")
         stats["seismic_points"] = [{"mag": a["raw"].get("mag"), "depth": a["raw"].get("depth"), "type": a["type"], "place": a.get("region"),
                                     "t": a["detected_at"]} for a in alerts if a.get("type") in base.SEISMIC_TYPES
                                    and isinstance(a.get("raw"), dict) and a["raw"].get("mag") is not None][:200]
@@ -4731,12 +4748,14 @@ def fetch_all_v25() -> Dict[str, Any]:
                 if n in base.SOURCE_STATUS:
                     base.SOURCE_STATUS[n]["ms"] = ms
         log_index(idx, stats, len(incidents))
-        notify_events(alerts, incidents, stats.get("special_statements", []))
+        notify_events(active, incidents, stats.get("special_statements", []))
     except Exception as e:
         log.warning(f"enriquecimiento v2.5: {e}")
     return result
 
 
+PRE_HOOKS: List[Any] = []
+POST_HOOKS: List[Any] = []
 base.fetch_all = fetch_all_v25
 
 
@@ -4961,7 +4980,7 @@ def svg_line(title, labels, values, color="#e5484d", w=560, h=170):
 def render_html(rep: Dict[str, Any]) -> str:
     lvl_col = {"NORMAL": "#17c964", "VIGILANCIA": "#eab308", "ELEVADO": "#f97316", "CRÍTICO": "#e5484d"}.get(rep["level"], "#71717a")
     tl = rep["timeline"]
-    h = [f"""<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>Informe OSINT {rep['generated_at'][:16]}</title>
+    h = [f"""<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"><title>GEWOM · Informe {rep['generated_at'][:16]}</title>
 <style>body{{font:14px/1.5 system-ui,sans-serif;max-width:980px;margin:0 auto;padding:20px;color:#1f2430;background:#fff}}
 h1{{font-size:22px;margin:0}}h2{{font-size:16px;border-bottom:2px solid #e5e7eb;padding-bottom:4px;margin-top:26px}}
 .banner{{background:{lvl_col};color:#fff;padding:14px 18px;border-radius:8px;margin:14px 0}}.banner b{{font-size:20px}}
@@ -5084,7 +5103,7 @@ def geojson_of(snap: Dict[str, Any]) -> dict:
 @app.route("/api/report")
 def v25_report():
     fmt = request.args.get("format", "html").lower()
-    hours = request.args.get("hours", 24.0, type=float)
+    hours = _hrs()
     rep = collect_report(hours)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     if fmt == "json":
@@ -5138,7 +5157,7 @@ def v25_export_geojson():
 
 @app.route("/api/download/all")
 def v25_download_all():
-    hours = request.args.get("hours", 24.0, type=float)
+    hours = _hrs()
     snap = live_snapshot()
     rep = collect_report(hours)
     rows = base.query_history(hours=hours, limit=5000)
@@ -5167,7 +5186,7 @@ def v25_download_all():
 
 @app.route("/api/analytics")
 def v25_analytics():
-    hours = max(1.0, min(request.args.get("hours", 24.0, type=float), 168.0))
+    hours = max(1.0, min(_hrs(), 168.0))
     rows = base.query_history(hours=hours, limit=5000)
     return jsonify({"hours": hours, "group_timeline": hist_group_timeline(rows, hours),
                     "by_group": dict(Counter(GROUP_OF_TYPE.get(r.get("type"), "Otros") for r in rows)),
@@ -5449,6 +5468,1211 @@ else:
     log.warning("No se encontró </body> en el panel base: la interfaz v2.5 no se inyectó")
 
 
+
+# ============================================================
+# ===== v2.6: ACCIONES, ESCALADA, ANALYTICS, GRAFO, DOSSIER, EXPORTACIONES =====
+# ============================================================
+import difflib
+
+VERSION = "2.6"
+APP_VERSION = "2.6"
+base.APP_VERSION = "2.6"
+SEV_W = {"critical": 3, "high": 2, "medium": 1, "low": 0}
+TYPE_COLORS = {"missile_alert": "#ff3344", "air_raid": "#ff6677", "kyiv_alert": "#ff3344", "drone_missile_track": "#ff8800",
+               "seismic_explosion": "#aa66ff", "explosion_candidate": "#c77dff", "nuclear_test_candidate": "#ff00aa",
+               "earthquake": "#4488ff", "thermal_anomaly": "#ffaa33", "official_statement": "#2cf5a6", "telegram_signal": "#5ee7ff",
+               "news": "#8aa4d6", "war_news": "#8aa4d6", "news_geo": "#8aa4d6", "state_media": "#ffd60a", "natural_event": "#00ccff",
+               "disaster": "#00ccff", "flight_activity": "#cccccc", "acled_conflict": "#ff66aa", "conflict_event": "#ff66aa"}
+_ANA_CACHE: Dict[Any, Tuple[float, dict]] = {}
+V26_CACHE_TTL = 60.0
+
+
+# ------------------------------------------------------------
+# Claves estables y tabla de acciones (FP / eliminado / fusionado)
+# ------------------------------------------------------------
+def action_key_parts(source, typ, region, desc, detected_at) -> str:
+    """Texto (noticias, Telegram...): clave estable entre ciclos. Sensores: clave por hora (como el fingerprint base)."""
+    if typ in TEXT_TYPES:
+        s = f"{source}|{typ}|{str(desc)[:160]}"
+    else:
+        s = "|".join([str(source), str(typ), str(region), str(desc)[:160], str(detected_at or "")[:13]])
+    return hashlib.sha1(s.encode("utf-8", "ignore")).hexdigest()
+
+
+def alert_key(a: dict) -> str:
+    return action_key_parts(a.get("source"), a.get("type"), a.get("region"), a.get("description"), a.get("detected_at"))
+
+
+def init_v26_db():
+    with base._db_lock:
+        conn = sqlite3.connect(base.DB_PATH, timeout=10)
+        conn.execute("""CREATE TABLE IF NOT EXISTS alert_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, fingerprint TEXT, action TEXT, reason TEXT, merged_into TEXT,
+            alert_type TEXT, region TEXT, description TEXT, source TEXT, created_at TEXT)""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_actions_fp ON alert_actions(fingerprint)")
+        conn.commit()
+        conn.close()
+
+
+def _db(sql: str, params: tuple = (), many: bool = False, write: bool = False):
+    with base._db_lock:
+        conn = sqlite3.connect(base.DB_PATH, timeout=10)
+        try:
+            cur = conn.execute(sql, params)
+            rows = cur.fetchall() if not write else None
+            if write:
+                conn.commit()
+                return cur.lastrowid
+            return rows
+        finally:
+            conn.close()
+
+
+def actions_map() -> Dict[str, dict]:
+    try:
+        rows = _db("SELECT id, fingerprint, action, merged_into FROM alert_actions ORDER BY id ASC")
+    except Exception:
+        return {}
+    return {r[1]: {"id": r[0], "action": r[2], "merged_into": r[3] or ""} for r in rows}
+
+
+def add_action(key: str, action: str, reason: str = "", merged_into: str = "", meta: Optional[dict] = None) -> int:
+    meta = meta or {}
+    return _db("INSERT INTO alert_actions (fingerprint, action, reason, merged_into, alert_type, region, description, source, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+               (key, action, reason[:300], merged_into, meta.get("type", ""), str(meta.get("region", ""))[:120],
+                str(meta.get("description", ""))[:300], str(meta.get("source", ""))[:80], base.now_iso()), write=True)
+
+
+# ------------------------------------------------------------
+# Escalada (heurística explicable, NO es un modelo entrenado) y duplicados
+# ------------------------------------------------------------
+_TYPE_LO = {"explosion_candidate": 1.0, "seismic_explosion": 1.0, "nuclear_test_candidate": 1.5, "missile_alert": 0.8, "kyiv_alert": 0.8,
+            "air_raid": 0.5, "drone_missile_track": 0.5, "thermal_anomaly": 0.2, "telegram_signal": -0.2, "news": -0.3, "war_news": -0.3,
+            "state_media": -0.5, "earthquake": -1.0, "natural_event": -1.0, "disaster": -0.8, "flight_activity": -0.5}
+
+
+def esc_calc(a: dict, zone_n: int = 0) -> Tuple[float, List[list]]:
+    sev, cr, t = a.get("severity", "low"), a.get("cred", "D") or "D", a.get("type")
+    f = [("Prior (base)", -2.0), (f"Severidad {sev}", {"critical": 2.0, "high": 1.2, "medium": 0.4, "low": -0.3}.get(sev, 0.0)),
+         (f"Credibilidad de fuente {cr}", {"A": 0.5, "B": 0.2, "C": 0.0, "D": -0.4}.get(cr, 0.0)), (f"Tipo {t}", _TYPE_LO.get(t, 0.0))]
+    cn = int(a.get("corr_n") or 0)
+    if cn:
+        f.append((f"Cruzado con {cn} fuente(s) independiente(s)", 0.6 * min(cn, 3)))
+    f.append((f"Confianza del incidente {a.get('corr_conf')}", {"alta": 0.8, "media": 0.4}.get(a.get("corr_conf"), 0.0)))
+    tags = a.get("tags") or []
+    if t == "official_statement" and set(tags) & base.WARNING_TAGS:
+        f.append(("Comunicado de alto impacto", 1.2))
+    if "correlado" in tags:
+        f.append(("Sismo correlado con ataques", 0.5))
+    if zone_n >= 5:
+        f.append((f"{zone_n} alertas aéreas cerca en 1 h", 0.6))
+    if _age(a) > 6 * 3600:
+        f.append(("Antigüedad > 6 h", -0.8))
+    z = sum(d for _l, d in f)
+    p = 100.0 / (1.0 + math.exp(-z))
+    return round(p, 1), [[l, round(d, 2)] for l, d in f if d]
+
+
+def alert_score(a: dict, prob: float) -> int:
+    return int(min(100, 0.5 * prob + 12.5 * SEV_W.get(a.get("severity", "low"), 0) + 5 * min(int(a.get("corr_n") or 0), 3)))
+
+
+def _jac(x: set, y: set) -> float:
+    u = x | y
+    return len(x & y) / len(u) if u else 0.0
+
+
+def mark_dups(alerts: List[dict]):
+    """Mismo titular en fuentes distintas (Jaccard >= 0.8, ±12 h): el posterior queda como duplicado del primero."""
+    txt = [a for a in alerts if a.get("type") in TEXT_TYPES and _age(a) <= 12 * 3600 and not a.get("excluded")]
+    txt.sort(key=lambda a: base.epoch_of(a["detected_at"]))
+    txt = txt[-400:]
+    toks = [_tok(a.get("description", "")) for a in txt]
+    for i in range(len(txt)):
+        if len(toks[i]) < 4:
+            continue
+        for j in range(i):
+            if txt[j].get("dup_of") or txt[j]["source"] == txt[i]["source"]:
+                continue
+            if _jac(toks[i], toks[j]) >= 0.8:
+                txt[i]["dup_of"] = txt[j].get("fingerprint") or alert_key(txt[j])
+                txt[j]["dedup_count"] = int(txt[j].get("dedup_count") or 0) + 1
+                break
+
+
+def hook_flags(alerts: List[dict]):
+    m = actions_map()
+    for a in alerts:
+        k = alert_key(a)
+        a["fingerprint"] = k
+        act = m.get(k)
+        if act:
+            a["action_id"] = act["id"]
+            if act["action"] == "fp":
+                a["fp"] = True
+            elif act["action"] == "deleted":
+                a["deleted"] = True
+            elif act["action"] == "merged":
+                a["merged_into"] = act["merged_into"]
+        if a.get("fp") or a.get("deleted") or a.get("merged_into"):
+            a["excluded"] = True
+    mark_dups(alerts)
+
+
+def hook_escalation(alerts: List[dict], stats: dict, incidents: List[dict]):
+    recent = [(float(a["lat"]), float(a["lon"])) for a in alerts if alert_group(a) == "Alertas" and hasgeo(a)
+              and not a.get("excluded") and _age(a) <= 3600 and not a.get("geo_approx")]
+    probs = []
+    for a in alerts:
+        zn = 0
+        if recent and hasgeo(a):
+            la, lo = float(a["lat"]), float(a["lon"])
+            zn = sum(1 for (x, y) in recent if abs(x - la) < 1.4 and base.haversine_km(la, lo, x, y) <= 150)
+        p, f = esc_calc(a, zn)
+        a["prob_escalada"], a["esc_factors"], a["score"] = p, f, alert_score(a, p)
+        if not a.get("excluded"):
+            probs.append(p)
+    stats["esc_mean"] = round(sum(probs) / len(probs), 1) if probs else 0.0
+
+
+PRE_HOOKS.append(hook_flags)
+POST_HOOKS.append(hook_escalation)
+
+
+def live_find(key: str) -> Tuple[Optional[dict], Dict[str, Any]]:
+    snap = live_snapshot()
+    for a in snap["alerts"]:
+        if a.get("fingerprint") == key:
+            return a, snap
+    return None, snap
+
+
+# ------------------------------------------------------------
+# Histórico como "alertas": filas de la BD convertidas para reutilizar el motor de cruce
+# ------------------------------------------------------------
+_TG_FALLBACK = {(48.0, 37.0), (55.0, 37.0)}
+
+
+def v26_rows(hours: float, limit: int = 8000, since_h: float = 0.0) -> List[dict]:
+    a = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    b = (datetime.now(timezone.utc) - timedelta(hours=since_h)).isoformat()
+    rows = _db("SELECT source, alert_type, region, lat, lon, severity, description, detected_at, link, cred, tags FROM alerts "
+               "WHERE detected_at >= ? AND detected_at < ? ORDER BY detected_at DESC LIMIT ?", (a, b, int(limit)))
+    out = []
+    for r in rows:
+        d = {"source": r[0], "type": r[1], "region": r[2], "lat": r[3], "lon": r[4], "severity": r[5] or "low", "description": r[6] or "",
+             "detected_at": r[7], "link": r[8], "cred": r[9] or "D", "tags": [t for t in (r[10] or "").split(",") if t]}
+        d["fingerprint"] = alert_key(d)
+        d["group"] = alert_group(d)
+        if d["type"] in TEXT_TYPES:
+            loc = base.geolocate_text(d["description"])
+            d["place"] = loc[2] if loc else ""
+            if not loc or ((d["lat"], d["lon"]) in _TG_FALLBACK and d["type"] == "telegram_signal" and not loc):
+                d["geo_known"] = False
+        else:
+            d["place"] = str(d["region"] or "").split(",")[0][:40]
+        out.append(d)
+    return out
+
+
+def _flag_rows(rows: List[dict]):
+    m = actions_map()
+    for d in rows:
+        act = m.get(d["fingerprint"])
+        if act:
+            d["action_id"] = act["id"]
+            d["fp"] = act["action"] == "fp"
+            d["deleted"] = act["action"] == "deleted"
+            d["merged_into"] = act["merged_into"] if act["action"] == "merged" else ""
+        d["excluded"] = bool(d.get("fp") or d.get("deleted") or d.get("merged_into"))
+
+
+_orig_qh = base.query_history
+
+
+def _qh_v26(*args, **kw):
+    rows = _orig_qh(*args, **kw)
+    for r in rows:
+        r["fingerprint"] = action_key_parts(r["source"], r["type"], r["region"], r["description"], r["detected_at"])
+    return rows
+
+
+base.query_history = _qh_v26
+
+
+# ------------------------------------------------------------
+# Analytics (todas las gráficas de la pestaña ANALYTICS)
+# ------------------------------------------------------------
+def _bin_plan(hours: float) -> Tuple[int, int]:
+    bin_h = 1 if hours <= 24 else (6 if hours <= 168 else 24)
+    return bin_h, max(1, int(hours // bin_h))
+
+
+def _mean_sev_pct(sev_counts: Dict[str, int]) -> float:
+    tot = sum(sev_counts.values())
+    return round(100.0 * sum(SEV_W.get(k, 0) * v for k, v in sev_counts.items()) / (3.0 * tot), 1) if tot else 0.0
+
+
+def _window_stats(rows: List[dict], total: int, sev: Dict[str, int], nsrc: int, fp: int, hours_span_alerts: List[dict]) -> dict:
+    cand = [d for d in rows if d["type"] in CORR_TYPES and is_precise(d) and not d.get("excluded")]
+    inc_n = sum(1 for d in cand if d.get("incident_id"))
+    places = {d["place"] for d in rows if d.get("place") and d["place"] not in COUNTRY_NAMES}
+    escs = [esc_calc(d)[0] for d in rows[:3000] if not d.get("excluded")]
+    return {"total": total, "critical": sev.get("critical", 0), "high": sev.get("high", 0),
+            "corr_rate": round(100.0 * inc_n / len(cand), 1) if cand else 0.0,
+            "fp_rate": round(100.0 * fp / total, 1) if total else 0.0,
+            "esc_mean": round(sum(escs) / len(escs), 1) if escs else 0.0,
+            "mean_sev": _mean_sev_pct(sev), "sources": nsrc, "places": len(places)}
+
+
+def compute_analytics(hours: float) -> dict:
+    hours = max(1.0, min(float(hours), 720.0))
+    ck = round(hours)
+    c = _ANA_CACHE.get(ck)
+    if c and time.time() - c[0] < V26_CACHE_TTL:
+        return c[1]
+    now = datetime.now(timezone.utc)
+    t_cur = (now - timedelta(hours=hours)).isoformat()
+    t_prev = (now - timedelta(hours=2 * hours)).isoformat()
+    rows = v26_rows(2 * hours, limit=8000)
+    _flag_rows(rows)
+    alerts_like = [d for d in rows]
+    build_incidents(alerts_like, window_h=2 * hours, max_n=3000)
+    cur = [d for d in rows if d["detected_at"] >= t_cur]
+    prev = [d for d in rows if d["detected_at"] < t_cur]
+
+    def sev_counts(a: str, b: str):
+        r = _db("SELECT severity, COUNT(*) FROM alerts WHERE detected_at >= ? AND detected_at < ? GROUP BY severity", (a, b))
+        return {k or "low": v for k, v in r}
+
+    far = (now + timedelta(days=1)).isoformat()
+    sev_c, sev_p = sev_counts(t_cur, far), sev_counts(t_prev, t_cur)
+    ns_c = _db("SELECT COUNT(DISTINCT source) FROM alerts WHERE detected_at >= ?", (t_cur,))[0][0]
+    ns_p = _db("SELECT COUNT(DISTINCT source) FROM alerts WHERE detected_at >= ? AND detected_at < ?", (t_prev, t_cur))[0][0]
+    fp_c = _db("SELECT COUNT(*) FROM alert_actions WHERE action='fp' AND created_at >= ?", (t_cur,))[0][0]
+    fp_p = _db("SELECT COUNT(*) FROM alert_actions WHERE action='fp' AND created_at >= ? AND created_at < ?", (t_prev, t_cur))[0][0]
+    m_cur = _window_stats(cur, sum(sev_c.values()), sev_c, ns_c, fp_c, cur)
+    m_prev = _window_stats(prev, sum(sev_p.values()), sev_p, ns_p, fp_p, prev)
+
+    # serie temporal exacta (SQL) + sparklines
+    bin_h, nb = _bin_plan(hours)
+    t0 = now - timedelta(hours=bin_h * nb)
+    ser = {"total": [0] * nb, "critical": [0] * nb, "high": [0] * nb}
+    for hk, sv, n in _db("SELECT substr(detected_at,1,13), severity, COUNT(*) FROM alerts WHERE detected_at >= ? GROUP BY 1, 2", (t0.isoformat(),)):
+        try:
+            k = int((datetime.strptime(hk, "%Y-%m-%dT%H").replace(tzinfo=timezone.utc) - t0).total_seconds() // (bin_h * 3600))
+        except Exception:
+            continue
+        if 0 <= k < nb:
+            ser["total"][k] += n
+            if sv in ("critical", "high"):
+                ser[sv][k] += n
+    labels = [(t0 + timedelta(hours=bin_h * i)).strftime("%d/%m %H:%M" if bin_h < 24 else "%d/%m") for i in range(nb)]
+    mean = sum(ser["total"]) / nb
+    sd = math.sqrt(sum((x - mean) ** 2 for x in ser["total"]) / nb) or 1.0
+    peaks = [i for i, x in enumerate(ser["total"]) if (x - mean) / sd > 2.0]
+    pct = [round(100.0 * ser["critical"][i] / ser["total"][i], 1) if ser["total"][i] else 0.0 for i in range(nb)]
+    corr_b, esc_b, fp_b = [[0, 0] for _ in range(nb)], [[0.0, 0] for _ in range(nb)], [0] * nb
+    for d in cur:
+        k = int((base.epoch_of(d["detected_at"]) - t0.timestamp()) // (bin_h * 3600))
+        if 0 <= k < nb:
+            if d["type"] in CORR_TYPES and is_precise(d):
+                corr_b[k][1] += 1
+                corr_b[k][0] += 1 if d.get("incident_id") else 0
+            esc_b[k][0] += esc_calc(d)[0]
+            esc_b[k][1] += 1
+    for (ca,) in _db("SELECT created_at FROM alert_actions WHERE action='fp' AND created_at >= ?", (t0.isoformat(),)):
+        k = int((base.epoch_of(ca) - t0.timestamp()) // (bin_h * 3600))
+        if 0 <= k < nb:
+            fp_b[k] += 1
+    spark = {"total": ser["total"], "critical": ser["critical"], "high": ser["high"],
+             "corr_rate": [round(100.0 * a / b, 1) if b else 0.0 for a, b in corr_b], "fp_rate": fp_b,
+             "esc_mean": [round(s / n, 1) if n else 0.0 for s, n in esc_b]}
+
+    # tipos, credibilidad, sankey (SQL exacto)
+    by_type = _db("SELECT alert_type, COUNT(*) FROM alerts WHERE detected_at >= ? GROUP BY 1 ORDER BY 2 DESC", (t_cur,))
+    types = [[t or "?", n] for t, n in by_type[:11]]
+    if len(by_type) > 11:
+        types.append(["Otros", sum(n for _t, n in by_type[11:])])
+    by_cred = {k or "D": v for k, v in _db("SELECT cred, COUNT(*) FROM alerts WHERE detected_at >= ? GROUP BY 1", (t_cur,))}
+    trip = _db("SELECT source, alert_type, severity, COUNT(*) FROM alerts WHERE detected_at >= ? GROUP BY 1,2,3", (t_cur,))
+    top_src = [s for s, _n in sorted(Counter({}).items())]
+    sc: Counter = Counter()
+    tc: Counter = Counter()
+    for s, t, sv, n in trip:
+        sc[s] += n
+        tc[t] += n
+    top_src = {s for s, _n in sc.most_common(8)}
+    top_typ = {t for t, _n in tc.most_common(8)}
+    l1: Counter = Counter()
+    l2: Counter = Counter()
+    for s, t, sv, n in trip:
+        s2, t2 = (s if s in top_src else "Otras fuentes"), (t if t in top_typ else "Otros")
+        l1[(s2, t2)] += n
+        l2[(t2, sv or "low")] += n
+    sankey = {"links": [{"source": "S:" + a, "target": "T:" + b, "value": v} for (a, b), v in l1.items()] +
+                         [{"source": "T:" + a, "target": "V:" + b, "value": v} for (a, b), v in l2.items()]}
+
+    # severidad por región (muestra de filas)
+    reg: Dict[str, Counter] = defaultdict(Counter)
+    for d in cur:
+        if d.get("excluded") or d["type"] in NON_CONFLICT:
+            continue
+        pl = d.get("place")
+        if pl:
+            reg[pl][d["severity"]] += 1
+    top_reg = sorted(reg, key=lambda r: -sum(reg[r].values()))[:10]
+    regions = [{"region": r, **{s: reg[r].get(s, 0) for s in ("critical", "high", "medium", "low")}} for r in top_reg]
+
+    # calendario
+    cal_days = max(28, int(math.ceil(hours / 24.0)))
+    cal = {k: n for k, n in _db("SELECT substr(detected_at,1,10), COUNT(*) FROM alerts WHERE detected_at >= ? GROUP BY 1",
+                                ((now - timedelta(days=cal_days)).isoformat(),))}
+
+    def radar(m: dict, ref_total: int) -> List[float]:
+        return [round(100.0 * m["total"] / max(ref_total, 1), 1), m["mean_sev"], m["corr_rate"], min(100.0, round(m["sources"] * 5.0, 1)),
+                min(100.0, round(m["places"] * 100.0 / 15.0, 1)), m["fp_rate"]]
+
+    rt = max(m_cur["total"], m_prev["total"], 1)
+    crit_rate = 100.0 * m_cur["critical"] / m_cur["total"] if m_cur["total"] else 0.0
+    gauge = round(min(100.0, 0.4 * m_cur["mean_sev"] + 0.3 * m_cur["corr_rate"] + 0.2 * min(100.0, m_cur["sources"] * 5.0) + 0.1 * crit_rate), 1)
+    live = live_snapshot()
+    top10 = sorted([a for a in live["alerts"] if not a.get("excluded") and a.get("score") is not None],
+                   key=lambda a: (a["score"], a["detected_at"]), reverse=True)[:10]
+    payload = {
+        "hours": hours, "generated_at": base.now_iso(), "sample_rows": len(rows),
+        "kpis": {"cur": m_cur, "prev": m_prev, "spark": spark},
+        "timeseries": {"labels": labels, "total": ser["total"], "critical": ser["critical"], "pct": pct, "peaks": peaks},
+        "types": types, "cred": by_cred, "sankey": sankey, "regions": regions,
+        "calendar": cal, "cal_days": cal_days,
+        "radar": {"labels": ["Volumen", "Severidad media", "Correlación", "Diversidad de fuentes", "Cobertura geográfica", "Tasa de FP"],
+                  "cur": radar(m_cur, rt), "prev": radar(m_prev, rt)},
+        "gauge": {"value": gauge, "state": "Estable" if gauge < 34 else ("Elevado" if gauge < 67 else "Crítico"),
+                  "parts": {"severidad_media": m_cur["mean_sev"], "correlacion": m_cur["corr_rate"], "diversidad": min(100.0, m_cur["sources"] * 5.0), "criticos": round(crit_rate, 1)}},
+        "top10": [{"fingerprint": a["fingerprint"], "type": a["type"], "region": a.get("place") or a.get("region"), "source": a["source"],
+                   "score": a["score"], "prob": a["prob_escalada"], "detected_at": a["detected_at"], "severity": a["severity"],
+                   "description": a["description"][:160]} for a in top10],
+        "note": "Probabilidad de escalada = índice heurístico explicable, no un modelo entrenado ni una probabilidad calibrada.",
+    }
+    _ANA_CACHE[ck] = (time.time(), payload)
+    return payload
+
+
+@app.route("/api/analytics2")
+def v26_analytics2():
+    try:
+        return jsonify(compute_analytics(_hrs()))
+    except Exception as e:
+        log.warning(f"analytics2: {e}")
+        return jsonify({"error": str(e)[:200]}), 500
+
+
+# ------------------------------------------------------------
+# Grafo de correlaciones
+# ------------------------------------------------------------
+def build_graph(hours: float, show_all: bool = False) -> dict:
+    hours = max(1.0, min(float(hours), 720.0))
+    rows = v26_rows(hours, limit=6000)
+    _flag_rows(rows)
+    incs = build_incidents(rows, window_h=hours, max_n=1500, keep=True)
+    nodes: Dict[str, dict] = {}
+    edges: List[dict] = []
+
+    def node(d: dict) -> dict:
+        p, _f = esc_calc(d)
+        return {"id": d["fingerprint"], "type": d["type"], "place": d.get("place") or "", "severity": d["severity"], "score": alert_score(d, p),
+                "prob": p, "fp": bool(d.get("fp")), "deleted": bool(d.get("deleted") or d.get("merged_into")), "source": d["source"], "cred": d.get("cred", "D"),
+                "detected_at": d["detected_at"], "description": d["description"][:200], "lat": d.get("lat"), "lon": d.get("lon"),
+                "color": {"critical": "#ff3344", "high": "#ff8800", "medium": "#ffcc00", "low": "#9aa7bd"}.get(d["severity"], "#9aa7bd"), "link": d.get("link")}
+
+    for inc in incs[:60]:
+        mem = inc["_mem"][-40:]
+        for d in mem:
+            nodes.setdefault(d["fingerprint"], node(d))
+        for i in range(len(mem)):
+            for j in range(i + 1, len(mem)):
+                x, y = mem[i], mem[j]
+                dt = abs(base.epoch_of(x["detected_at"]) - base.epoch_of(y["detected_at"]))
+                dist = base.haversine_km(float(x["lat"]), float(x["lon"]), float(y["lat"]), float(y["lon"]))
+                if dt > CLUSTER_MIN * 60 or dist > CLUSTER_KM or source_family(x["source"]) == source_family(y["source"]):
+                    continue
+                strength = 3 + (1 if alert_group(x) == alert_group(y) else 0)
+                crit = x["severity"] == "critical" or y["severity"] == "critical"
+                edges.append({"id": f"{x['fingerprint'][:8]}-{y['fingerprint'][:8]}", "source": x["fingerprint"], "target": y["fingerprint"],
+                              "strength": strength, "crit": crit, "dt_min": round(dt / 60.0, 1), "dist_km": round(dist, 1)})
+    if show_all:
+        for d in rows[:150]:
+            if d["fingerprint"] not in nodes and d["type"] not in NON_CONFLICT:
+                nodes[d["fingerprint"]] = node(d)
+    ids = set(nodes)
+    edges = [e for e in edges if e["source"] in ids and e["target"] in ids][:3000]
+    return {"hours": hours, "nodes": [{"data": n} for n in nodes.values()], "edges": [{"data": e} for e in edges],
+            "stats": {"nodes": len(nodes), "edges": len(edges), "incidents": len(incs)}}
+
+
+@app.route("/api/graph")
+def v26_graph():
+    try:
+        return jsonify(build_graph(_hrs(), request.args.get("all", "0") == "1"))
+    except Exception as e:
+        log.warning(f"graph: {e}")
+        return jsonify({"error": str(e)[:200]}), 500
+
+
+# ------------------------------------------------------------
+# Acciones: FP / eliminar / fusionar / restaurar / duplicados / dossier
+# ------------------------------------------------------------
+@app.route("/api/alerts/action", methods=["POST"])
+def v26_action():
+    b = request.get_json(silent=True) or {}
+    key, act = str(b.get("fingerprint") or ""), str(b.get("action") or "")
+    if not re.fullmatch(r"[0-9a-f]{40}", key) or act not in ("fp", "deleted"):
+        return jsonify({"error": "fingerprint o acción no válidos"}), 400
+    a, _s = live_find(key)
+    if not a:
+        a = next((r for r in v26_rows(168, limit=8000) if r.get("fingerprint") == key), None)
+    meta = {"type": (a or {}).get("type") or b.get("type", ""), "region": (a or {}).get("region") or b.get("region", ""),
+            "description": (a or {}).get("description") or b.get("description", ""), "source": (a or {}).get("source") or b.get("source", "")}
+    aid = add_action(key, act, str(b.get("reason") or ""), "", meta)
+    _ANA_CACHE.clear()
+    _orig_invalidate()
+    return jsonify({"ok": True, "id": aid})
+
+
+@app.route("/api/alerts/actions/<int:aid>", methods=["DELETE"])
+def v26_action_delete(aid):
+    _db("DELETE FROM alert_actions WHERE id = ?", (aid,), write=True)
+    _ANA_CACHE.clear()
+    _orig_invalidate()
+    return jsonify({"ok": True})
+
+
+def _actions_query(args) -> List[dict]:
+    sql, p = "SELECT id, created_at, fingerprint, alert_type, region, action, reason, merged_into, description, source FROM alert_actions WHERE 1=1", []
+    if args.get("action"):
+        sql += " AND action = ?"
+        p.append(args.get("action"))
+    if args.get("from"):
+        sql += " AND created_at >= ?"
+        p.append(args.get("from"))
+    if args.get("to"):
+        sql += " AND created_at <= ?"
+        p.append(args.get("to") + "T23:59:59")
+    sql += " ORDER BY id DESC LIMIT 2000"
+    keys = ("id", "created_at", "fingerprint", "type", "region", "action", "reason", "merged_into", "description", "source")
+    return [dict(zip(keys, r)) for r in _db(sql, tuple(p))]
+
+
+@app.route("/api/alerts/actions")
+def v26_actions():
+    rows = _actions_query(request.args)
+    return jsonify({"count": len(rows), "counts": dict(Counter(r["action"] for r in rows)), "actions": rows})
+
+
+@app.route("/api/alerts/actions.csv")
+def v26_actions_csv():
+    rows = _actions_query(request.args)
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    cols = ["id", "created_at", "fingerprint", "type", "region", "action", "reason", "merged_into", "source", "description"]
+    w.writerow(cols)
+    for r in rows:
+        w.writerow([r[c] for c in cols])
+    return Response("﻿" + buf.getvalue(), mimetype="text/csv", headers={"Content-Disposition": "attachment; filename=acciones.csv"})
+
+
+@app.route("/api/alerts/duplicates")
+def v26_duplicates():
+    key = request.args.get("fp", "")
+    a, snap = live_find(key)
+    if not a:
+        return jsonify({"error": "Alerta no encontrada en el ciclo en vivo"}), 404
+    base_txt = (a.get("description") or "").lower()
+    out = []
+    for o in snap["alerts"]:
+        if o is a or o.get("excluded") or o.get("fingerprint") == key:
+            continue
+        ratio = difflib.SequenceMatcher(None, base_txt, (o.get("description") or "").lower()).ratio()
+        if ratio >= 0.7 and abs(base.epoch_of(o["detected_at"]) - base.epoch_of(a["detected_at"])) <= 48 * 3600:
+            out.append({"fingerprint": o["fingerprint"], "source": o["source"], "description": o["description"][:200], "detected_at": o["detected_at"],
+                        "similarity": round(100 * ratio)})
+    out.sort(key=lambda x: -x["similarity"])
+    return jsonify({"duplicates": out[:15]})
+
+
+@app.route("/api/alerts/merge-duplicates", methods=["POST"])
+def v26_merge():
+    b = request.get_json(silent=True) or {}
+    keep = str(b.get("keep") or "")
+    merge = [str(x) for x in (b.get("merge") or []) if re.fullmatch(r"[0-9a-f]{40}", str(x)) and str(x) != keep]
+    if not re.fullmatch(r"[0-9a-f]{40}", keep) or not merge:
+        return jsonify({"error": "keep y merge[] requeridos"}), 400
+    snap = live_snapshot()
+    byk = {a.get("fingerprint"): a for a in snap["alerts"]}
+    for k in merge:
+        a = byk.get(k) or {}
+        add_action(k, "merged", "fusionado manualmente", keep, {"type": a.get("type", ""), "region": a.get("region", ""), "description": a.get("description", ""), "source": a.get("source", "")})
+    _ANA_CACHE.clear()
+    _orig_invalidate()
+    return jsonify({"ok": True, "merged": len(merge)})
+
+
+@app.route("/api/dossier")
+def v26_dossier():
+    key = request.args.get("fp", "")
+    a, snap = live_find(key)
+    pool = snap["alerts"]
+    if not a:  # no está en el ciclo en vivo: buscarla en el histórico (últimos 7 días)
+        rows = v26_rows(168, limit=8000)
+        _flag_rows(rows)
+        a = next((r for r in rows if r.get("fingerprint") == key), None)
+        if not a:
+            return jsonify({"error": "Alerta no encontrada"}), 404
+        pool = rows
+    t0 = base.epoch_of(a["detected_at"])
+    related, corr = [], []
+    if hasgeo(a):
+        for o in pool:
+            if o is a or not hasgeo(o) or o.get("excluded"):
+                continue
+            dt = (base.epoch_of(o["detected_at"]) - t0) / 60.0
+            if abs(dt) > 30:
+                continue
+            dist = base.haversine_km(float(a["lat"]), float(a["lon"]), float(o["lat"]), float(o["lon"]))
+            if dist > 150:
+                continue
+            item = {"fingerprint": o["fingerprint"], "source": o["source"], "type": o["type"], "severity": o["severity"], "cred": o.get("cred", "D"),
+                    "description": o["description"][:160], "detected_at": o["detected_at"], "dt_min": round(dt, 1), "dist_km": round(dist, 1)}
+            related.append(item)
+            why = [f"±{abs(item['dt_min']):.0f} min", f"{item['dist_km']:.0f} km"]
+            if alert_group(o) == alert_group(a):
+                why.append("mismo grupo")
+            if source_family(o["source"]) != source_family(a["source"]):
+                why.append("fuente distinta")
+            corr.append({**item, "why": why, "strength": len(why)})
+    related.sort(key=lambda x: x["dt_min"])
+    corr.sort(key=lambda x: -x["strength"])
+    iid = a.get("incident_id")
+    inc = next((i for i in snap["stats"].get("incidents", []) if i["id"] == iid), None)
+    sources = [{"source": m["source"], "cred": m["cred"], "link": m.get("link"), "detected_at": m["detected_at"], "description": m["description"], "dup_of": ""}
+               for m in (inc["members"] if inc else [])]
+    if not sources:
+        sources = [{"source": a["source"], "cred": a.get("cred", "D"), "link": a.get("link"), "detected_at": a["detected_at"], "description": a["description"][:160], "dup_of": a.get("dup_of", "")}]
+    for o in pool:
+        if o.get("dup_of") == key:
+            sources.append({"source": o["source"], "cred": o.get("cred", "D"), "link": o.get("link"), "detected_at": o["detected_at"], "description": o["description"][:160], "dup_of": key})
+    audit = [r for r in _actions_query({}) if r["fingerprint"] == key or r["merged_into"] == key]
+    slim = {k: v for k, v in a.items() if k != "raw"}
+    slim["raw"] = {k: v for k, v in (a.get("raw") or {}).items() if isinstance(v, (str, int, float, bool)) or v is None}
+    return jsonify({"alert": slim, "related": related[:25], "correlations": corr[:15], "sources": sources[:30], "incident": ({k: v for k, v in inc.items() if k != "members"} if inc else None), "audit": audit})
+
+
+# ------------------------------------------------------------
+# Exportaciones ampliadas (respetan los filtros por query params)
+# ------------------------------------------------------------
+def _filtered_rows(args) -> List[dict]:
+    hours = float(args.get("hours", 24) or 24)
+    rows = v26_rows(hours, limit=5000)
+    _flag_rows(rows)
+    snap = live_snapshot()
+    live = {a.get("fingerprint"): a for a in snap["alerts"]}
+    q, sev, src, cred, grp = (args.get(k, "") for k in ("q", "severity", "source", "cred", "group"))
+    show_fp, show_del = args.get("show_fp") == "1", args.get("show_deleted") == "1"
+    minp = float(args.get("min_prob", 0) or 0)
+    out = []
+    for d in rows:
+        lv = live.get(d["fingerprint"]) or {}
+        d["prob_escalada"] = lv.get("prob_escalada", esc_calc(d)[0])
+        d["correlated"] = bool(lv.get("incident_id"))
+        d["dedup_count"] = int(lv.get("dedup_count") or 0)
+        if d.get("fp") and not show_fp or (d.get("deleted") or d.get("merged_into")) and not show_del:
+            continue
+        if sev and d["severity"] != sev or src and d["source"] != src or cred and d["cred"] != cred or grp and d["group"] != grp:
+            continue
+        if q and q.lower() not in f"{d['source']} {d['description']} {d['region']} {d['type']}".lower():
+            continue
+        if d["prob_escalada"] < minp:
+            continue
+        out.append(d)
+    return out
+
+
+def v26_export():
+    fmt = request.args.get("format", "csv").lower()
+    hours = _hrs()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+    def dl(body, mt, ext):
+        return Response(body, mimetype=mt, headers={"Content-Disposition": f"attachment; filename=export_{stamp}.{ext}"})
+
+    if fmt == "analytics.json":
+        return dl(json.dumps(compute_analytics(hours), ensure_ascii=False, indent=1, default=str), "application/json", "analytics.json")
+    if fmt == "report.md":
+        return dl(render_md(collect_report(hours)), "text/markdown", "md")
+    if fmt == "report.pdf":
+        try:
+            from weasyprint import HTML  # type: ignore
+            return dl(HTML(string=render_html(collect_report(hours))).write_pdf(), "application/pdf", "pdf")
+        except ImportError:
+            return jsonify({"error": "PDF opcional: instala weasyprint (pip install weasyprint) o usa format=report.md / el informe HTML"}), 501
+    if fmt == "graph.json":
+        g = build_graph(hours, request.args.get("all") == "1")
+        ng = {"directed": False, "multigraph": False, "graph": {"hours": hours}, "nodes": [n["data"] for n in g["nodes"]],
+              "links": [{"source": e["data"]["source"], "target": e["data"]["target"], **{k: v for k, v in e["data"].items() if k not in ("source", "target")}} for e in g["edges"]]}
+        return dl(json.dumps(ng, ensure_ascii=False, indent=1, default=str), "application/json", "graph.json")
+    rows = _filtered_rows(request.args)
+    if fmt == "json":
+        return dl(json.dumps(rows, ensure_ascii=False, indent=1, default=str), "application/json", "json")
+    if fmt == "geojson":
+        feats = [{"type": "Feature", "geometry": {"type": "Point", "coordinates": [float(d["lon"]), float(d["lat"])]},
+                  "properties": {k: d[k] for k in ("source", "type", "severity", "cred", "detected_at", "description", "prob_escalada", "correlated") if k in d}}
+                 for d in rows if hasgeo(d)]
+        return dl(json.dumps({"type": "FeatureCollection", "features": feats}, ensure_ascii=False), "application/geo+json", "geojson")
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    cols = ["detected_at", "source", "type", "severity", "cred", "region", "lat", "lon", "description", "link", "prob_escalada", "fp", "correlated", "dedup_count"]
+    w.writerow(cols)
+    for d in rows:
+        w.writerow([d.get(c, "") if c != "fp" else int(bool(d.get("fp"))) for c in cols])
+    return dl("﻿" + buf.getvalue(), "text/csv", "csv")
+
+
+app.view_functions["api_export"] = v26_export
+init_v26_db()
+
+
+EXTRA_UI26 = r"""<script>
+/* ===================== GEWOM v2.6 — interfaz ===================== */
+const $=id=>document.getElementById(id);
+function mapOn(){try{if(typeof map!=='undefined'&&map&&map.on)map.on.apply(map,arguments);}catch(e){console.warn('mapOn',e);}}
+const SEV_COL={critical:'#ff3344',high:'#ff8800',medium:'#ffcc00',low:'#9aa7bd'};
+const TYPE_COL={missile_alert:'#ff3344',air_raid:'#ff6677',kyiv_alert:'#ff3344',drone_missile_track:'#ff8800',seismic_explosion:'#aa66ff',explosion_candidate:'#c77dff',nuclear_test_candidate:'#ff00aa',earthquake:'#4488ff',thermal_anomaly:'#ffaa33',official_statement:'#2cf5a6',telegram_signal:'#5ee7ff',news:'#8aa4d6',war_news:'#8aa4d6',news_geo:'#8aa4d6',state_media:'#ffd60a',natural_event:'#00ccff',disaster:'#00ccff',flight_activity:'#cccccc',acled_conflict:'#ff66aa',conflict_event:'#ff66aa'};
+const TYPE_EMOJI={missile_alert:'🚀',air_raid:'⚠',kyiv_alert:'🚀',drone_missile_track:'🛩',seismic_explosion:'💥',explosion_candidate:'💥',nuclear_test_candidate:'☢',earthquake:'🌍',thermal_anomaly:'🔥',official_statement:'🏛',telegram_signal:'✈',news:'📰',war_news:'📰',news_geo:'📰',state_media:'📢',natural_event:'🌪',disaster:'🌪',flight_activity:'✈',acled_conflict:'🎯',conflict_event:'🎯'};
+const ICON_PATH={
+ missile_alert:'<path d="M12 2 L12 14 M8 14 L16 14 L12 22 Z M10 6 L14 6"/>',
+ air_raid:'<path d="M12 3 L22 20 L2 20 Z M12 10 L12 15 M12 17 L12 18"/>',
+ drone_missile_track:'<circle cx="12" cy="12" r="3"/><path d="M3 3 L9 9 M21 3 L15 9 M3 21 L9 15 M21 21 L15 15"/>',
+ seismic_explosion:'<path d="M12 2 L15 8 L22 9 L17 14 L18 21 L12 18 L6 21 L7 14 L2 9 L9 8 Z"/>',
+ earthquake:'<path d="M2 12 L6 12 L8 6 L12 18 L16 10 L18 12 L22 12"/>',
+ thermal_anomaly:'<path d="M12 2 C12 2 8 8 8 12 C8 16 12 20 12 20 C12 20 16 16 16 12 C16 8 12 2 12 2 Z M12 20 C12 20 10 17 12 14 C14 17 12 20 12 20 Z"/>',
+ official_statement:'<path d="M2 12 L12 2 L22 12 M4 12 L4 20 L20 20 L20 12 M10 20 L10 14 L14 14 L14 20"/>',
+ telegram_signal:'<path d="M22 2 L2 10 L10 14 L12 22 L16 14 L22 2 Z"/>',
+ news:'<path d="M4 4 H20 V20 H4 Z M8 8 H16 M8 12 H16 M8 16 H13"/>',
+ state_media:'<path d="M3 10 V14 L8 14 L18 19 V5 L8 10 Z"/>',
+ disaster:'<circle cx="12" cy="12" r="8"/><path d="M12 7 V13 M12 16 V17"/>',
+ flight_activity:'<path d="M12 2 L14 10 L22 14 L22 16 L14 14 L13 20 L16 22 L16 23 L12 22 L8 23 L8 22 L11 20 L10 14 L2 16 L2 14 L10 10 Z"/>',
+ conflict:'<circle cx="12" cy="12" r="7"/><path d="M12 2 V7 M12 17 V22 M2 12 H7 M17 12 H22"/>',
+ bolt:'<path d="M13 2 L4 14 L11 14 L9 22 L18 10 L11 10 Z"/>',
+ dflt:'<circle cx="12" cy="12" r="5"/>'};
+const ICON_ALIAS={kyiv_alert:'missile_alert',explosion_candidate:'seismic_explosion',nuclear_test_candidate:'seismic_explosion',war_news:'news',news_geo:'news',natural_event:'disaster',acled_conflict:'conflict',conflict_event:'conflict'};
+const iconCache=new Map();
+function svgIcon(type,sev,size){
+ const k=type+'|'+sev; let ic=iconCache.get(k);
+ if(!ic){
+  const col=SEV_COL[sev]||SEV_COL.low, p=ICON_PATH[ICON_ALIAS[type]||type]||ICON_PATH.dflt;
+  const svg=`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="48" height="48"><circle cx="12" cy="12" r="11.2" fill="rgba(10,10,10,.85)" stroke="${col}" stroke-width="1.6"/><g transform="translate(4.8 4.8) scale(.6)" fill="${col}" fill-opacity=".35" stroke="${col}" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">${p}</g></svg>`;
+  ic={url:'data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svg),width:48,height:48,anchorY:24}; iconCache.set(k,ic);
+ }
+ return ic;
+}
+const BOLT_ICON={url:'data:image/svg+xml;charset=utf-8,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="48" height="48"><circle cx="12" cy="12" r="11" fill="rgba(0,40,50,.9)" stroke="#5ee7ff" stroke-width="1.6"/><g transform="translate(5 5) scale(.58)" fill="#5ee7ff" stroke="#5ee7ff" stroke-width="2" stroke-linejoin="round"><path d="M13 2 L4 14 L11 14 L9 22 L18 10 L11 10 Z"/></g></svg>'),width:48,height:48,anchorY:24};
+function iconSize(sev){return sev==='critical'?30:sev==='high'?26:sev==='medium'?22:18;}
+function sevColArr(sev){const h=SEV_COL[sev]||SEV_COL.low;return [parseInt(h.slice(1,3),16),parseInt(h.slice(3,5),16),parseInt(h.slice(5,7),16)];}
+
+/* ---------- estilos + estructura ---------- */
+(function(){
+const st=document.createElement('style');
+st.textContent=`.tabs{overflow-x:auto}.tab{flex:0 0 auto!important;padding:10px 9px!important}
+#dossier{position:absolute;top:12px;right:calc(min(var(--sbw,450px),70vw) + 8px);width:390px;max-height:calc(100% - 24px);overflow:auto;background:var(--bg-panel);border:1px solid var(--border);border-radius:4px;z-index:30;display:none;font-size:11px;padding:10px}
+#dossier h4{font-size:10px;color:var(--yellow);margin:10px 0 4px;text-transform:uppercase}
+#graphOv{position:absolute;top:0;left:0;right:var(--sbw,450px);bottom:0;background:#0b0f1a;z-index:25;display:none}
+#graphCy{position:absolute;inset:44px 0 0 0}
+#graphBar{position:absolute;top:0;left:0;right:0;height:44px;display:flex;gap:6px;align-items:center;padding:0 10px;background:var(--bg-panel);border-bottom:1px solid var(--border);flex-wrap:wrap;z-index:2}
+#graphSide{position:absolute;top:44px;right:0;width:300px;bottom:0;background:var(--bg-panel);border-left:1px solid var(--border);overflow:auto;padding:10px;font-size:11px;z-index:2}
+#graphLeg{position:absolute;left:10px;bottom:10px;background:rgba(17,17,17,.9);border:1px solid var(--border);padding:6px;font-size:10px;z-index:2;border-radius:3px}
+#mapLegend{position:absolute;left:12px;bottom:96px;background:rgba(17,17,17,.92);border:1px solid var(--border);padding:6px 8px;font-size:10px;z-index:9;display:none;border-radius:3px;max-height:50%;overflow:auto}
+#mapLegend div{display:flex;align-items:center;gap:6px;margin:2px 0}
+.kpi6{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:12px}
+.k6{background:var(--bg-card);border:1px solid var(--border);border-radius:3px;padding:8px}.k6 .kv{font-size:22px;font-weight:bold}.k6 .kl{font-size:9px;color:var(--dim);text-transform:uppercase}.k6 .kd{font-size:10px}
+.cal{display:grid;grid-template-columns:repeat(7,1fr);gap:3px}.cal div{aspect-ratio:1.4;border-radius:2px;font-size:8px;color:#000;display:flex;align-items:center;justify-content:center}
+.cal .h{background:none;color:var(--dim);aspect-ratio:auto}
+table.tb{width:100%;border-collapse:collapse;font-size:10px}table.tb th,table.tb td{border-bottom:1px solid var(--border);padding:4px;text-align:left;vertical-align:top}table.tb th{cursor:pointer;color:var(--yellow)}
+.btn.sm{padding:2px 6px;font-size:9px}.modal{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:500;display:flex;align-items:center;justify-content:center}.modal>div{background:var(--bg-panel);border:1px solid var(--border);padding:14px;width:520px;max-height:80vh;overflow:auto;border-radius:4px}
+.fadv{border:1px solid var(--border);border-radius:3px;padding:6px;margin-bottom:8px}.fadv summary{cursor:pointer;color:var(--yellow);font-size:10px;text-transform:uppercase}.fadv label{display:flex;gap:6px;align-items:center;font-size:10px;margin:4px 0}
+.chipc{display:inline-block;border:1px solid var(--border);padding:1px 8px;margin:2px;border-radius:10px;font-size:10px;cursor:pointer;user-select:none}.chipc.on{border-color:var(--green);color:var(--green)}
+#sbToggle{position:absolute;top:50%;right:var(--sbw,450px);width:14px;height:48px;background:var(--bg-panel);border:1px solid var(--border);border-right:none;color:var(--dim);cursor:pointer;z-index:40;font-size:10px;border-radius:3px 0 0 3px}
+@media (prefers-reduced-motion: reduce){.pulse-off{display:none}}
+.sidebar{width:var(--sbw,450px)!important;max-width:100%;position:relative}
+.zoom-controls{right:calc(var(--sbw,450px) + 12px)!important}
+#sbDrag{position:absolute;left:-3px;top:0;bottom:0;width:7px;cursor:col-resize;z-index:41;background:transparent}#sbDrag:hover,#sbDrag.on{background:rgba(0,255,136,.35)}
+#sbBar{display:flex;gap:4px;align-items:center;padding:4px 8px;border-bottom:1px solid var(--border);flex-shrink:0;background:var(--bg-card)}
+#sbBar .sp{flex:1;font-size:9px;color:var(--dim)}
+#qBar{display:flex;flex-wrap:wrap;gap:4px;padding:6px 8px;border-bottom:1px solid var(--border);flex-shrink:0}
+#qBar .btn{padding:4px 7px;font-size:9px}
+body.sb-full #dossier{right:8px}
+body.sb-full .map-controls,body.sb-full .zoom-controls{display:none}
+body.sb-wide .content{font-size:12px}body.sb-wide .kpi6{grid-template-columns:repeat(3,1fr)}
+body.sb-wide #tab-analytics{display:none;columns:2;column-gap:12px}body.sb-wide #tab-analytics.active{display:block}
+body.sb-wide #tab-analytics .chart-box{break-inside:avoid}`;
+document.head.appendChild(st);
+const tabs=document.querySelector('.tabs'), side=document.querySelector('.sidebar'), main=document.querySelector('.main');
+tabs.insertAdjacentHTML('beforeend','<div class="tab" data-tab="analytics">📈 ANALYTICS</div><div class="tab" data-tab="graph">🕸 GRAFO</div><div class="tab" data-tab="actions">🗂 ACCIONES</div>');
+side.insertAdjacentHTML('beforeend',`
+<div class="content" id="tab-analytics">
+ <div class="frow" style="margin-bottom:10px"><select id="anRange" class="fi" onchange="loadAnalytics()"><option value="24">Ventana 24 h</option><option value="168">7 días</option><option value="720">30 días</option></select><button class="btn" style="flex:0 0 auto" onclick="loadAnalytics(true)">⟳</button></div>
+ <div id="anNote" class="hint"></div>
+ <div class="kpi6" id="anKpis"></div>
+ <div class="chart-box"><h3>ÍNDICE DE ESCALADA GLOBAL</h3><div id="anGauge"></div></div>
+ <div class="chart-box"><h3>EVENTOS POR TIPO (clic = filtrar)</h3><canvas id="anType"></canvas></div>
+ <div class="chart-box"><h3>CREDIBILIDAD DE LA FUENTE</h3><canvas id="anCred"></canvas></div>
+ <div class="chart-box"><h3>SERIE TEMPORAL (líneas verticales = picos z&gt;2)</h3><canvas id="anTime"></canvas></div>
+ <div class="chart-box"><h3>SEVERIDAD POR REGIÓN (top 10)</h3><canvas id="anReg"></canvas></div>
+ <div class="chart-box"><h3>CALENDARIO DE ACTIVIDAD</h3><div id="anCal"></div></div>
+ <div class="chart-box"><h3>RADAR — PERFIL DE LA VENTANA</h3><canvas id="anRadar"></canvas></div>
+ <div class="chart-box"><h3>FLUJO FUENTE → TIPO → SEVERIDAD</h3><div id="anSankey" class="hint">Cargando...</div></div>
+ <div class="chart-box"><h3>TOP 10 ALERTAS (clic en cabecera = ordenar)</h3><div id="anTop"></div></div>
+ <div class="frow"><button class="btn" onclick="location.href='/api/export?format=analytics.json&hours='+$('anRange').value">⬇ analytics.json</button><button class="btn" onclick="location.href='/api/export?format=report.md&hours='+$('anRange').value">⬇ report.md</button><button class="btn" onclick="location.href='/api/export?format=report.pdf&hours='+$('anRange').value">⬇ report.pdf</button><button class="btn" onclick="location.href='/api/export?format=graph.json&hours='+$('anRange').value">⬇ graph.json</button><button class="btn" onclick="location.href='/api/export?format=geojson&hours='+$('anRange').value">⬇ geojson</button></div>
+</div>
+<div class="content" id="tab-graph"><div class="hint">El grafo se abre sobre el mapa (más espacio). Nodos = alertas correlacionadas; aristas = cruce por tiempo, espacio, tipo y fuente distinta.</div><button class="btn btn-blue" onclick="openGraph()">ABRIR / REFRESCAR GRAFO</button></div>
+<div class="content" id="tab-actions">
+ <div class="frow" style="margin-bottom:8px"><select id="acAct" class="fi" onchange="loadActions()"><option value="">Todas</option><option value="fp">Falsos positivos</option><option value="deleted">Eliminadas</option><option value="merged">Fusionadas</option></select>
+ <input id="acFrom" class="fi" type="date" onchange="loadActions()" title="Desde"><input id="acTo" class="fi" type="date" onchange="loadActions()" title="Hasta"></div>
+ <div class="frow" style="margin-bottom:8px"><span id="acCnt" class="hint" style="flex:1"></span><button class="btn" onclick="exportActions()">⬇ CSV</button></div>
+ <div id="acTbl"></div>
+</div>`);
+side.insertAdjacentHTML('afterbegin','<div id="sbDrag" title="Arrastra para cambiar el ancho"></div><div id="sbBar"><span class="sp">PANEL</span><button class="btn" data-m="min" title="Ocultar panel">◀ OCULTAR</button><button class="btn" data-m="normal" title="Tamaño normal">▭ NORMAL</button><button class="btn" data-m="half" title="Mitad de la pantalla">◧ MITAD</button><button class="btn" data-m="full" title="Pantalla completa del panel">⛶ COMPLETO</button></div><div id="qBar"><button class="btn" onclick="loadData(true)" title="Forzar actualización de todas las fuentes">⟳ ACTUALIZAR</button><button class="btn" id="qCrit" onclick="qCritical()" title="Ver solo críticos">🔴 CRÍTICOS</button><button class="btn" onclick="qCorr()" title="Solo alertas con cruce de fuentes">🔗 CRUZADAS</button><button class="btn" onclick="qNow()" title="Última hora">⏱ 1 H</button><button class="btn" onclick="qZone()" title="Dibujar zona en el mapa">▭ ZONA</button><button class="btn" onclick="qPause()" title="Pausar / reanudar auto-refresco">⏯ PAUSA</button><button class="btn" onclick="qCopy()" title="Copiar resumen al portapapeles">📋 COPIAR</button><button class="btn" onclick="qSum()" title="Resumen rápido (top críticos)">📝 RESUMEN</button><button class="btn" onclick="window.open(\'/api/report?format=html\',\'_blank\',\'noopener\')" title="Abrir informe de situación">📄 INFORME</button><button class="btn" onclick="location.href=\'/api/export?format=csv&hours=24\'">⬇ CSV</button><button class="btn" onclick="location.href=\'/api/export?format=geojson&hours=24\'">⬇ GEOJSON</button><button class="btn" onclick="qFs()" title="Pantalla completa del navegador">🖥 PANTALLA</button><button class="btn btn-red" onclick="resetFilters()">↺ FILTROS</button></div>');
+main.insertAdjacentHTML('beforeend','<div id="dossier"></div><div id="graphOv"><div id="graphBar"></div><div id="graphCy"></div><div id="graphLeg"></div><div id="graphSide"><div class="hint">Haz clic en un nodo.</div></div></div><div id="mapLegend"></div><button id="sbToggle" title="Mostrar/ocultar panel">▶</button>');
+document.querySelector('.map-controls').insertAdjacentHTML('beforeend','<button class="btn" id="btnLeg" onclick="toggleLegend()">LEYENDA</button><button class="btn" id="btnTrk" onclick="toggleTracks()">TRAYECT.</button>');
+['analytics','graph','actions'].forEach(n=>tabs.querySelector('.tab[data-tab="'+n+'"]').addEventListener('click',()=>openTab(n)));
+document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{if(t.dataset.tab!=='graph')hideGraph();}));
+})();
+
+/* ---------- Chart.js: tema + tooltips en español ---------- */
+if(window.Chart){Chart.defaults.color='#dbe4f5';Chart.defaults.borderColor='#243152';
+ Chart.defaults.plugins.tooltip.callbacks.label=function(c){const t=c.chart.config.type;if(t==='doughnut'||t==='pie'){const tot=c.dataset.data.reduce((a,b)=>a+b,0)||1;return c.label+': '+c.raw+' ('+(100*c.raw/tot).toFixed(1)+'%)';}
+  const v=(c.raw&&typeof c.raw==='object')?(c.raw.y!=null?c.raw.y:c.raw.x):c.raw;return (c.dataset.label?c.dataset.label+': ':'')+v;};}
+
+/* ---------- tabs ---------- */
+function openTab(name){
+ document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.tab===name));
+ document.querySelectorAll('.content').forEach(x=>x.classList.toggle('active',x.id==='tab-'+name));
+ if(name==='links')loadLinks(); if(name==='report')initReportTab(); if(name==='analytics')loadAnalytics(); if(name==='actions')loadActions(); if(name==='graph')openGraph();
+}
+const _loadScripts={};
+function loadScript(url){return _loadScripts[url]||(_loadScripts[url]=new Promise((res,rej)=>{const s=document.createElement('script');s.src=url;s.onload=res;s.onerror=()=>rej(new Error('No se pudo cargar '+url));document.head.appendChild(s);}));}
+
+/* ---------- filtros avanzados (persisten en localStorage: gewom_filters) ---------- */
+const F_DEF={ageIdx:0,minProb:0,cred:{A:1,B:1,C:1,D:1},onlyCorr:false,minSrc:1,showFP:false,showDel:false,showMerged:false,region:'',zone:null};
+const AGE_STEPS=[0,5,15,30,60,180,720,1440];
+let F=JSON.parse(JSON.stringify(F_DEF));
+try{const s=localStorage.getItem('gewom_filters');if(s)F=Object.assign(JSON.parse(JSON.stringify(F_DEF)),JSON.parse(s));}catch(e){}
+function saveF(){try{localStorage.setItem('gewom_filters',JSON.stringify(F));}catch(e){}}
+function buildFilterPanel(){
+ if($('fAdv'))return;
+ $('fSearch').closest('.filterbar').insertAdjacentHTML('beforeend',`<details class="fadv" id="fAdv"><summary>⚙ Filtros avanzados</summary>
+ <label>Antigüedad: <b id="fAgeL">todo</b><input id="fAge" type="range" min="0" max="7" step="1" style="flex:1"></label>
+ <label>Escalada ≥ <b id="fProbL">0</b>%<input id="fProb" type="range" min="0" max="100" step="5" style="flex:1"></label>
+ <div id="fCredChips"></div>
+ <label><input id="fOnlyCorr" type="checkbox"> solo correlacionados</label>
+ <label>≥ <b id="fSrcL">1</b> fuentes distintas<input id="fSrc2" type="range" min="1" max="5" step="1" style="flex:1"></label>
+ <label><input id="fShowFP" type="checkbox"> mostrar falsos positivos</label>
+ <label><input id="fShowDel" type="checkbox"> mostrar eliminados</label>
+ <label><input id="fShowMer" type="checkbox"> mostrar fusionados/duplicados</label>
+ <div class="frow"><select id="fReg" class="fi"></select></div>
+ <div class="frow"><button class="btn" id="btnDraw" onclick="startDraw()">▭ DIBUJAR ZONA</button><button class="btn" onclick="clearZone()">LIMPIAR ZONA</button><button class="btn btn-red" onclick="resetFilters()">RESTABLECER</button></div></details>`);
+ const bind=(id,ev,fn)=>$(id).addEventListener(ev,()=>{fn();saveF();syncFilterUI();onFilterChange();});
+ bind('fAge','input',()=>F.ageIdx=+$('fAge').value); bind('fProb','input',()=>F.minProb=+$('fProb').value);
+ bind('fOnlyCorr','change',()=>F.onlyCorr=$('fOnlyCorr').checked); bind('fSrc2','input',()=>F.minSrc=+$('fSrc2').value);
+ bind('fShowFP','change',()=>F.showFP=$('fShowFP').checked); bind('fShowDel','change',()=>F.showDel=$('fShowDel').checked); bind('fShowMer','change',()=>F.showMerged=$('fShowMer').checked);
+ bind('fReg','change',()=>F.region=$('fReg').value);
+ $('fCredChips').innerHTML='Credibilidad: '+['A','B','C','D'].map(c=>`<span class="chipc" data-c="${c}">${c}</span>`).join('');
+ $('fCredChips').querySelectorAll('.chipc').forEach(ch=>ch.addEventListener('click',()=>{F.cred[ch.dataset.c]=F.cred[ch.dataset.c]?0:1;saveF();syncFilterUI();onFilterChange();}));
+ syncFilterUI();
+}
+function syncFilterUI(){
+ if(!$('fAdv'))return;
+ $('fAge').value=F.ageIdx;$('fAgeL').textContent=AGE_STEPS[F.ageIdx]?AGE_STEPS[F.ageIdx]+' min':'todo';
+ $('fProb').value=F.minProb;$('fProbL').textContent=F.minProb;$('fOnlyCorr').checked=F.onlyCorr;$('fSrc2').value=F.minSrc;$('fSrcL').textContent=F.minSrc;
+ $('fShowFP').checked=F.showFP;$('fShowDel').checked=F.showDel;$('fShowMer').checked=F.showMerged;
+ $('fCredChips').querySelectorAll('.chipc').forEach(ch=>ch.classList.toggle('on',!!F.cred[ch.dataset.c]));
+ const regs=Array.from(new Set(allAlerts.map(a=>a.place).filter(Boolean))).sort().slice(0,80);
+ $('fReg').innerHTML='<option value="">Región: todas</option>'+regs.map(r=>`<option value="${esc(r)}">${esc(r)}</option>`).join('');$('fReg').value=F.region;
+ $('btnDraw').textContent=F.zone?'▭ ZONA ACTIVA':'▭ DIBUJAR ZONA';
+}
+function resetFilters(){F=JSON.parse(JSON.stringify(F_DEF));try{localStorage.removeItem('gewom_filters');}catch(e){}clearZone(true);syncFilterUI();onFilterChange();toast('Filtros restablecidos');}
+function getVisible(){
+ const q=($('fSearch').value||'').trim().toLowerCase(), sev=$('fSev').value, src=$('fSrc').value, typ=$('fType').value, cred=$('fCred').value, grp=($('fGrp')||{}).value||'';
+ const ageMax=AGE_STEPS[F.ageIdx]*60, z=F.zone;
+ return baseAlerts().filter(a=>{
+  if(sev&&a.severity!==sev)return false; if(src&&a.source!==src)return false;
+  if(typ&&!(typeGroup(a)===typ||(typ==='sismo'&&typeGroup(a)==='explosion')))return false;
+  if(cred&&(a.cred||'D')!==cred)return false; if(!F.cred[a.cred||'D'])return false;
+  if(grp){if(grp.indexOf('tg:')===0){if(!(a.tags||[]).includes('grupo:'+grp.slice(3)))return false;}else if(grp==='__watch'){if(!(a.tags||[]).includes('vigilado'))return false;}else if(grpOf(a)!==grp)return false;}
+  if(ageMax&&(Date.now()-new Date(a.detected_at).getTime())/1000>ageMax)return false;
+  if(F.minProb&&(a.prob_escalada||0)<F.minProb)return false;
+  if(F.onlyCorr&&!a.incident_id)return false; if(F.minSrc>1&&((a.corr_n||0)+1)<F.minSrc)return false;
+  if(a.fp&&!F.showFP)return false; if(a.deleted&&!F.showDel)return false; if((a.merged_into||a.dup_of)&&!F.showMerged)return false;
+  if(F.region&&a.place!==F.region)return false;
+  if(z){if(!hasGeo(a))return false;const lo=+a.lon,la=+a.lat;if(lo<z.minLon||lo>z.maxLon||la<z.minLat||la>z.maxLat)return false;}
+  if(q&&!(((a.source||'')+' '+(a.description||'')+' '+(a.region||'')+' '+(a.type||'')+' '+(a.tags||[]).join(' ')).toLowerCase().includes(q)))return false;
+  return true;});
+}
+/* zona dibujada (rectángulo) */
+let drawing=false,drawStart=null;
+function ensureZoneLayer(){
+ if(!map.getSource('zone-rect'))map.addSource('zone-rect',{type:'geojson',data:{type:'FeatureCollection',features:[]}});
+ if(!map.getLayer('zone-fill'))map.addLayer({id:'zone-fill',type:'fill',source:'zone-rect',paint:{'fill-color':'#5ee7ff','fill-opacity':0.12}});
+ if(!map.getLayer('zone-line'))map.addLayer({id:'zone-line',type:'line',source:'zone-rect',paint:{'line-color':'#5ee7ff','line-width':2,'line-dasharray':[2,2]}});
+}
+function rectGeo(a,b){return {type:'FeatureCollection',features:[{type:'Feature',geometry:{type:'Polygon',coordinates:[[[a.lng,a.lat],[b.lng,a.lat],[b.lng,b.lat],[a.lng,b.lat],[a.lng,a.lat]]]}}]};}
+function showZone(){try{ensureZoneLayer();const z=F.zone;map.getSource('zone-rect').setData(z?rectGeo({lng:z.minLon,lat:z.minLat},{lng:z.maxLon,lat:z.maxLat}):{type:'FeatureCollection',features:[]});}catch(e){}}
+function startDraw(){drawing=true;map.dragPan.disable();map.getCanvas().style.cursor='crosshair';toast('Arrastra sobre el mapa para dibujar la zona');}
+function clearZone(silent){F.zone=null;saveF();showZone();syncFilterUI();if(!silent)onFilterChange();}
+mapOn('mousedown',e=>{if(!drawing)return;drawStart=e.lngLat;ensureZoneLayer();});
+mapOn('mousemove',e=>{if(drawing&&drawStart){try{map.getSource('zone-rect').setData(rectGeo(drawStart,e.lngLat));}catch(x){}}});
+mapOn('mouseup',e=>{if(!drawing||!drawStart)return;const a=drawStart,b=e.lngLat;drawing=false;drawStart=null;map.dragPan.enable();map.getCanvas().style.cursor='';
+ if(Math.abs(a.lng-b.lng)<0.01&&Math.abs(a.lat-b.lat)<0.01){showZone();return;}
+ F.zone={minLon:Math.min(a.lng,b.lng),maxLon:Math.max(a.lng,b.lng),minLat:Math.min(a.lat,b.lat),maxLat:Math.max(a.lat,b.lat)};saveF();syncFilterUI();onFilterChange();});
+mapOn('style.load',()=>{showZone();});
+mapOn('load',()=>{showZone();});
+
+/* ---------- acciones sobre alertas ---------- */
+async function alertAction(key,action,reason){
+ try{const r=await fetch('/api/alerts/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fingerprint:key,action,reason:reason||''})});const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);
+  toast(action==='fp'?'Marcada como falso positivo':'Eliminada');refreshAfterAction();}catch(e){toast('Error: '+e.message);}
+}
+function refreshAfterAction(){loadData(true);hideDossier();if($('tab-analytics').classList.contains('active'))loadAnalytics(true);if($('tab-actions').classList.contains('active'))loadActions();if($('graphOv').style.display==='block')openGraph();}
+async function restoreAction(id){await fetch('/api/alerts/actions/'+id,{method:'DELETE'});toast('Acción revertida');loadActions();loadData(true);}
+function exportActions(){const q=new URLSearchParams({action:$('acAct').value,from:$('acFrom').value,to:$('acTo').value});location.href='/api/alerts/actions.csv?'+q;}
+async function loadActions(){
+ const q=new URLSearchParams({action:$('acAct').value,from:$('acFrom').value,to:$('acTo').value});
+ try{const j=await (await fetch('/api/alerts/actions?'+q)).json();const c=j.counts||{};
+  $('acCnt').textContent='FP: '+(c.fp||0)+' · Eliminadas: '+(c.deleted||0)+' · Fusionadas: '+(c.merged||0);
+  const NM={fp:'FP',deleted:'Eliminado',merged:'Fusionado'};
+  $('acTbl').innerHTML=(j.actions||[]).length?'<table class="tb"><tr><th>Fecha</th><th>Tipo/Región</th><th>Acción</th><th>Motivo</th><th></th></tr>'+j.actions.map(a=>`<tr><td>${esc(fmtDateTime(a.created_at))}</td><td>${esc(a.type)}<br><span class="meta">${esc(a.region)}</span><div class="meta">${esc((a.description||'').slice(0,80))}</div></td><td>${esc(NM[a.action]||a.action)}${a.merged_into?'<br><a class="lnk" style="cursor:pointer" onclick="openDossier({fingerprint:\''+esc(a.merged_into)+'\'})">→ conservado</a>':''}</td><td>${esc(a.reason||'')}</td><td><button class="btn sm" onclick="restoreAction(${a.id})">RESTAURAR</button></td></tr>`).join('')+'</table>':'<div class="hint">Sin acciones.</div>';
+ }catch(e){$('acTbl').innerHTML='<div class="error-banner">'+esc(e.message)+'</div>';}
+}
+
+/* ---------- dossier ---------- */
+function hideDossier(){$('dossier').style.display='none';}
+function miniGauge(v){const a=Math.PI*(1-v/100),x=50+40*Math.cos(a),y=50-40*Math.sin(a),col=v<34?'#00ff88':v<67?'#ffcc00':'#ff3344';
+ return `<svg viewBox="0 0 100 58" width="120"><path d="M10 50 A40 40 0 0 1 90 50" fill="none" stroke="#333" stroke-width="9"/><path d="M10 50 A40 40 0 0 1 ${x.toFixed(1)} ${y.toFixed(1)}" fill="none" stroke="${col}" stroke-width="9"/><text x="50" y="50" text-anchor="middle" fill="#e0e0e0" font-size="14" font-weight="bold">${Math.round(v)}%</text></svg>`;}
+async function openDossier(a){
+ const key=a.fingerprint||a.key;const box=$('dossier');box.style.display='block';box.innerHTML='<div class="loading"><div class="spinner"></div>Cargando dossier...</div>';
+ try{if(!key)throw new Error('sin fingerprint');const r=await fetch('/api/dossier?fp='+encodeURIComponent(key));const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);renderDossier(j);}
+ catch(e){renderDossier({alert:a,related:[],correlations:[],sources:[{source:a.source,cred:a.cred||'D',link:a.link,detected_at:a.detected_at,description:a.description||''}],audit:[],note:'Dossier limitado ('+e.message+')'});}
+}
+function renderDossier(d){
+ const a=d.alert||{},sev=a.severity||'low',col=SEV_COL[sev];
+ const svg=`<svg viewBox="0 0 24 24" width="22" height="22" style="vertical-align:middle" fill="${col}" fill-opacity=".35" stroke="${col}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICON_PATH[ICON_ALIAS[a.type]||a.type]||ICON_PATH.dflt}</svg>`;
+ const rel=d.related||[];
+ const tl=rel.length?`<div style="position:relative;height:30px;border-bottom:1px solid #444;margin:6px 4px 14px"><div style="position:absolute;left:50%;top:0;height:30px;border-left:1px dashed #888"></div>${rel.map((r,i)=>`<span title="${esc(r.source)}" style="position:absolute;left:${50+(r.dt_min/30)*46}%;top:${8+(i%3)*7}px;width:9px;height:9px;border-radius:50%;background:${SEV_COL[r.severity]||'#999'};cursor:pointer" onclick="openDossier({fingerprint:'${esc(r.fingerprint)}'})"></span>`).join('')}<span style="position:absolute;left:0;top:20px;font-size:8px;opacity:.6">-30 min</span><span style="position:absolute;right:0;top:20px;font-size:8px;opacity:.6">+30 min</span></div>`:'<div class="hint">Sin eventos relacionados (±30 min, ±150 km).</div>';
+ const fac=(a.esc_factors||[]).map(f=>`<div>${f[1]>0?'<span style="color:#ff8800">＋':'<span style="color:#00ff88">−'}${Math.abs(f[1]).toFixed(1)}</span> ${esc(f[0])}</div>`).join('');
+ const k=a.fingerprint||'';
+ $('dossier').innerHTML=`<div class="frow" style="justify-content:space-between"><b>${svg} ${esc(a.type||'')} · ${esc(a.place||a.region||'')}</b><button class="btn sm" onclick="hideDossier()">✕</button></div>
+ <div><span class="sevtag" style="color:${col};border-color:${col}">${esc(sev)}</span> <span class="credtag cred-${esc(a.cred||'D')}">${esc(a.cred||'D')}</span> Escalada <b>${a.prob_escalada!=null?Number(a.prob_escalada).toFixed(0)+'%':'—'}</b> · score ${a.score!=null?a.score:'—'}</div>
+ <div class="tt-b">${esc(a.description||'')}</div><div class="hint">${esc(fmtDateTime(a.detected_at))} · ${esc(ageTxt(a.detected_at))} · ${esc(a.source||'')}</div>${d.note?`<div class="hint" style="color:var(--orange)">${esc(d.note)}</div>`:''}
+ <h4>Timeline (±30 min, ±150 km)</h4>${tl}${rel.slice(0,8).map(r=>`<div class="tg-msg" style="cursor:pointer" onclick="openDossier({fingerprint:'${esc(r.fingerprint)}'})"><span class="tm">${r.dt_min>0?'+':''}${r.dt_min} min · ${r.dist_km} km</span> <b>${esc(r.source)}</b> — ${esc(r.description)}</div>`).join('')}
+ <h4>Fuentes que lo reportan</h4>${(d.sources||[]).map(s=>`<div class="tg-msg"><span class="credtag cred-${esc(s.cred)}">${esc(s.cred)}</span> <b>${esc(s.source)}</b> <span class="tm">${esc(fmtTime(s.detected_at))}</span>${s.dup_of?' <span class="sevtag">duplicado</span>':''}${safeUrl(s.link)?` <a class="lnk" href="${esc(safeUrl(s.link))}" target="_blank" rel="noopener">↗</a>`:''}</div>`).join('')||'<div class="hint">—</div>'}
+ <h4>Correlaciones</h4>${(d.correlations||[]).slice(0,8).map(c=>`<div class="tg-msg" style="cursor:pointer" onclick="openDossier({fingerprint:'${esc(c.fingerprint)}'})"><b>${esc(c.source)}</b> — ${esc(c.description.slice(0,90))}<div class="meta">por qué: ${esc(c.why.join(' · '))}</div></div>`).join('')||'<div class="hint">Sin correlaciones.</div>'}
+ <h4>Probabilidad de escalada (índice heurístico)</h4><div class="frow">${miniGauge(a.prob_escalada||0)}<div style="flex:1;font-size:10px">${fac||'—'}</div></div><div class="hint">Heurística explicable (log-odds aditivo). No es un modelo entrenado ni una probabilidad calibrada.</div>
+ <h4>Acciones</h4><div class="frow"><button class="btn" onclick="alertAction('${esc(k)}','fp')">🚫 FP</button><button class="btn btn-red" onclick="alertAction('${esc(k)}','deleted')">🗑 ELIMINAR</button><button class="btn" onclick="openMerge('${esc(k)}')">🔗 FUSIONAR CON...</button><button class="btn" onclick="copyJson('${esc(k)}')">📋 COPIAR JSON</button></div>
+ <h4>Histórico (auditoría)</h4>${(d.audit||[]).map(x=>`<div class="tg-msg"><span class="tm">${esc(fmtDateTime(x.created_at))}</span> ${esc(x.action)} ${esc(x.reason||'')}</div>`).join('')||'<div class="hint">Sin acciones previas.</div>'}`;
+ window._dossierAlert=a;
+}
+function copyJson(){const a=Object.assign({},window._dossierAlert||{});delete a.raw;navigator.clipboard.writeText(JSON.stringify(a,null,2)).then(()=>toast('JSON copiado'),()=>toast('No se pudo copiar'));}
+async function openMerge(key){
+ try{const j=await (await fetch('/api/alerts/duplicates?fp='+encodeURIComponent(key))).json();const list=j.duplicates||[];
+  const m=document.createElement('div');m.className='modal';m.innerHTML=`<div><h4 style="color:var(--yellow)">Fusionar con duplicados sugeridos (≥70% similitud)</h4>${list.length?list.map((d,i)=>`<label style="display:flex;gap:8px;margin:6px 0;font-size:11px"><input type="checkbox" data-k="${esc(d.fingerprint)}"><span><b>${esc(d.source)}</b> · ${d.similarity}% · ${esc(fmtTime(d.detected_at))}<br>${esc(d.description)}</span></label>`).join(''):'<div class="hint">Sin sugerencias.</div>'}<div class="frow" style="margin-top:10px"><button class="btn" id="mgOk">CONFIRMAR</button><button class="btn" id="mgNo">CANCELAR</button></div></div>`;
+  document.body.appendChild(m);$('mgNo').onclick=()=>m.remove();
+  $('mgOk').onclick=async()=>{const ks=Array.from(m.querySelectorAll('input:checked')).map(x=>x.dataset.k);if(!ks.length){toast('Selecciona al menos uno');return;}
+   const r=await fetch('/api/alerts/merge-duplicates',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({keep:key,merge:ks})});const jj=await r.json();m.remove();toast(r.ok?'Fusionados: '+jj.merged:(jj.error||'Error'));refreshAfterAction();};
+ }catch(e){toast('Error: '+e.message);}
+}
+function focusIdx(i){const a=visibleList[i];if(!a)return;if(hasGeo(a))map.flyTo({center:[Number(a.lon),Number(a.lat)],zoom:6,duration:1000});openDossier(a);}
+function clickFn(info){const o=info&&info.object;if(!o)return;
+ if(o.kind==='cluster'){map.flyTo({center:o.coordinates,zoom:Math.min(map.getZoom()+2.5,11),duration:700});return;}
+ if(o.kind==='incident'){new maplibregl.Popup({closeButton:true,maxWidth:'360px'}).setLngLat(o.coordinates).setHTML(`<div style="color:#111;font-family:'Courier New',monospace;font-size:11px">${incidentHtml(o.inc)}</div>`).addTo(map);return;}
+ openDossier(o.a);}
+
+/* ---------- mapa: iconos SVG, clusters, pulso, trayectorias, cono de incertidumbre ---------- */
+let showTracks=false,pulseTimer=null,baseLayers=[],pulseData={crit:[],cones:[]},moveT=null;
+const REDUCED=window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+function toggleTracks(){showTracks=!showTracks;$('btnTrk').classList.toggle('active',showTracks);updateMap();}
+function toggleLegend(){const l=$('mapLegend');if(!l.dataset.built){l.innerHTML='<b>Símbolos</b>'+Object.keys(ICON_PATH).filter(k=>!['bolt','dflt','conflict'].includes(k)).concat(['conflict']).map(k=>`<div><svg viewBox="0 0 24 24" width="18" height="18" fill="#9aa7bd" fill-opacity=".35" stroke="#dbe4f5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICON_PATH[k]}</svg>${esc(k)}</div>`).join('')+'<div><svg viewBox="0 0 24 24" width="18" height="18" fill="#5ee7ff" stroke="#5ee7ff" stroke-width="2">'+ICON_PATH.bolt+'</svg>correlado</div><hr style="border-color:#333"><div><span style="color:#ff3344">●</span> critical <span style="color:#ff8800">●</span> high <span style="color:#ffcc00">●</span> medium <span style="color:#9aa7bd">●</span> low</div>';l.dataset.built=1;}
+ l.style.display=l.style.display==='block'?'none':'block';$('btnLeg').classList.toggle('active',l.style.display==='block');}
+function clusterPts(pts){
+ if(map.getZoom()>=9)return {singles:pts,clusters:[]};
+ const grid=new Map();pts.forEach(p=>{const q=map.project(p.coordinates);const k=Math.floor(q.x/50)+':'+Math.floor(q.y/50);let g=grid.get(k);if(!g){g=[];grid.set(k,g);}g.push(p);});
+ const singles=[],clusters=[];
+ grid.forEach(g=>{if(g.length<2){singles.push(g[0]);return;}
+  const cnt={},sevMax={critical:3,high:2,medium:1,low:0};let ms='low',lo=0,la=0;
+  g.forEach(p=>{cnt[p.a.type]=(cnt[p.a.type]||0)+1;if(sevMax[p.a.severity]>sevMax[ms])ms=p.a.severity;lo+=p.coordinates[0];la+=p.coordinates[1];});
+  const dom=Object.keys(cnt).sort((x,y)=>cnt[y]-cnt[x])[0];
+  clusters.push({kind:'cluster',coordinates:[lo/g.length,la/g.length],n:g.length,dom,sev:ms,types:cnt});});
+ return {singles,clusters};
+}
+function updateMap(){
+ if(!map)return;if(!mapReady){mapPending=true;return;}
+ const pts=getVisible().filter(hasGeo).map(a=>({kind:'alert',coordinates:[Number(a.lon),Number(a.lat)],a,grp:typeGroup(a)}));
+ lastPts=pts;initOverlay();
+ if(!overlay){updateMapFallback2(pts);return;}
+ const {singles,clusters}=clusterPts(pts);const layers=[];
+ if(showHeat&&deck.HeatmapLayer)layers.push(new deck.HeatmapLayer({id:'heat',data:pts,getPosition:d=>d.coordinates,getWeight:d=>({critical:4,high:2.5,medium:1.2,low:.5}[d.a.severity]||.5),radiusPixels:45,intensity:1.4,threshold:0.05}));
+ if(showLinks&&lastIncidents.length){
+  const links=[],incPts=lastIncidents.map(i=>({kind:'incident',coordinates:[i.lon,i.lat],inc:i}));
+  lastIncidents.forEach(i=>i.members.forEach(m=>links.push({from:[i.lon,i.lat],to:[m.lon,m.lat]})));
+  if(deck.LineLayer)layers.push(new deck.LineLayer({id:'links',data:links,getSourcePosition:d=>d.from,getTargetPosition:d=>d.to,getColor:[255,204,0,150],getWidth:1.5,widthUnits:'pixels'}));
+  layers.push(new deck.ScatterplotLayer({id:'inc',data:incPts,getPosition:d=>d.coordinates,getRadius:d=>Math.max(30000,d.inc.radius_km*1000+20000),stroked:true,filled:false,getLineColor:d=>d.inc.conf==='alta'?[0,255,136,230]:d.inc.conf==='media'?[255,136,0,230]:[160,160,160,200],lineWidthMinPixels:2,radiusMinPixels:16,radiusMaxPixels:70,pickable:true}));
+ }
+ if(showTracks&&deck.PathLayer){const tr=pts.filter(p=>Array.isArray(p.a.track)&&p.a.track.length>1);
+  layers.push(new deck.PathLayer({id:'tracks',data:tr,getPath:d=>d.a.track.map(t=>[t[1],t[0]]),getColor:d=>sevColArr(d.a.severity).concat([200]),getWidth:2,widthUnits:'pixels'}));
+  layers.push(new deck.ScatterplotLayer({id:'trkpts',data:tr.flatMap(p=>p.a.track.map(t=>({coordinates:[t[1],t[0]],sev:p.a.severity}))),getPosition:d=>d.coordinates,getFillColor:d=>sevColArr(d.sev),radiusUnits:'pixels',getRadius:3}));}
+ layers.push(new deck.IconLayer({id:'icons',data:singles,getPosition:d=>d.coordinates,getIcon:d=>svgIcon(d.a.type,d.a.severity),getSize:d=>iconSize(d.a.severity),sizeUnits:'pixels',pickable:true,autoHighlight:true,highlightColor:[255,255,255,90]}));
+ const corr=singles.filter(p=>p.a.incident_id||(p.a.tags||[]).includes('correlado'));
+ if(corr.length)layers.push(new deck.IconLayer({id:'bolts',data:corr,getPosition:d=>d.coordinates,getIcon:()=>BOLT_ICON,getSize:12,sizeUnits:'pixels',getPixelOffset:[11,-11],pickable:false}));
+ if(clusters.length){
+  layers.push(new deck.ScatterplotLayer({id:'clcirc',data:clusters,getPosition:d=>d.coordinates,radiusUnits:'pixels',getRadius:d=>18+Math.min(14,Math.log2(d.n)*4),getFillColor:d=>sevColArr(d.sev).concat([90]),stroked:true,getLineColor:d=>sevColArr(d.sev).concat([255]),lineWidthMinPixels:2,pickable:true}));
+  layers.push(new deck.IconLayer({id:'clicon',data:clusters,getPosition:d=>d.coordinates,getIcon:d=>svgIcon(d.dom,d.sev),getSize:22,sizeUnits:'pixels',pickable:false}));
+  if(deck.TextLayer)layers.push(new deck.TextLayer({id:'cltxt',data:clusters,getPosition:d=>d.coordinates,getText:d=>String(d.n),getSize:13,sizeUnits:'pixels',getColor:[255,255,255,255],getPixelOffset:[0,-26],fontWeight:'bold',background:true,getBackgroundColor:[10,10,10,200],pickable:false}));}
+ baseLayers=layers;
+ pulseData.crit=singles.filter(p=>p.a.severity==='critical');
+ pulseData.cones=singles.filter(p=>p.a.type==='explosion_candidate');
+ overlay.setProps({layers:pulseLayers(0).concat(layers),getTooltip:tipFn,onClick:clickFn,pickingRadius:8});
+ startPulse();
+}
+function pulseLayers(t){
+ const L=[];
+ if(pulseData.crit.length)L.push(new deck.ScatterplotLayer({id:'pulse',data:pulseData.crit,getPosition:d=>d.coordinates,radiusUnits:'pixels',getRadius:10+t*24,stroked:true,filled:false,getLineColor:[255,51,68,Math.round(220*(1-t))],lineWidthMinPixels:2,pickable:false,updateTriggers:{getRadius:t,getLineColor:t}}));
+ if(pulseData.cones.length)L.push(new deck.ScatterplotLayer({id:'cone',data:pulseData.cones,getPosition:d=>d.coordinates,radiusUnits:'meters',getRadius:d=>((d.a.raw&&d.a.raw.uncertainty_km)||15)*1000*(0.3+0.7*t),stroked:true,filled:true,getFillColor:[199,125,255,Math.round(40*(1-t))],getLineColor:[199,125,255,Math.round(200*(1-t)+40)],lineWidthMinPixels:1,pickable:false,updateTriggers:{getRadius:t,getFillColor:t,getLineColor:t}}));
+ return L;
+}
+function startPulse(){
+ if(pulseTimer){clearInterval(pulseTimer);pulseTimer=null;}
+ if(REDUCED||!overlay||(!pulseData.crit.length&&!pulseData.cones.length))return;
+ pulseTimer=setInterval(()=>{if(document.hidden)return;const t=(Date.now()%1800)/1800;overlay.setProps({layers:pulseLayers(t).concat(baseLayers)});},110);
+}
+mapOn('zoomend',()=>updateMap());
+mapOn('moveend',()=>{clearTimeout(moveT);moveT=setTimeout(()=>{if(map.getZoom()<9)updateMap();},150);});
+
+/* ---------- ANALYTICS ---------- */
+const KPI_DEF=[['total','Total eventos','var(--text)',1],['critical','Críticos','var(--red)',1],['high','Altos','var(--orange)',1],['corr_rate','Tasa de correlación %','#5ee7ff',0],['fp_rate','Falsos positivos %','#9aa7bd',1],['esc_mean','Prob. media de escalada %','var(--green)',1]];
+function gaugeSvg(v,state,parts){
+ const a=Math.PI*(1-v/100),nx=100+70*Math.cos(a),ny=100-70*Math.sin(a);
+ const arc=(f,t,c)=>{const a1=Math.PI*(1-f/100),a2=Math.PI*(1-t/100);return `<path d="M${100+80*Math.cos(a1)} ${100-80*Math.sin(a1)} A80 80 0 0 1 ${100+80*Math.cos(a2)} ${100-80*Math.sin(a2)}" fill="none" stroke="${c}" stroke-width="14"/>`;};
+ return `<svg viewBox="0 0 200 118" width="100%" style="max-width:300px;display:block;margin:auto">${arc(0,33,'#00ff88')}${arc(33,66,'#ffcc00')}${arc(66,100,'#ff3344')}<line x1="100" y1="100" x2="${nx.toFixed(1)}" y2="${ny.toFixed(1)}" stroke="#fff" stroke-width="3"/><circle cx="100" cy="100" r="5" fill="#fff"/><text x="100" y="92" text-anchor="middle" fill="#fff" font-size="22" font-weight="bold" dy="-18">${Math.round(v)}</text></svg><div style="text-align:center;font-size:13px;font-weight:bold">Estado: ${esc(state)}</div><div class="hint" style="text-align:center">40% severidad media (${parts.severidad_media}) · 30% correlación (${parts.correlacion}) · 20% diversidad (${parts.diversidad}) · 10% críticos (${parts.criticos})</div>`;
+}
+const centerPlugin={id:'centerTxt',afterDraw(ch){if(ch.config.type!=='doughnut'||!ch.options.plugins.centerTxt)return;const{ctx,chartArea:{left,right,top,bottom}}=ch;ctx.save();ctx.fillStyle='#dbe4f5';ctx.font='bold 20px Courier New';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(ch.options.plugins.centerTxt.text,(left+right)/2,(top+bottom)/2);ctx.restore();}};
+const peaksPlugin={id:'peaksLn',afterDatasetsDraw(ch){const pk=ch.options.plugins.peaksLn&&ch.options.plugins.peaksLn.idx;if(!pk)return;const{ctx,scales:{x},chartArea:{top,bottom}}=ch;ctx.save();ctx.strokeStyle='rgba(255,51,68,.55)';ctx.setLineDash([4,4]);pk.forEach(i=>{const px=x.getPixelForValue(i);ctx.beginPath();ctx.moveTo(px,top);ctx.lineTo(px,bottom);ctx.stroke();});ctx.restore();}};
+const totalsPlugin={id:'totalsEnd',afterDatasetsDraw(ch){if(!ch.options.plugins.totalsEnd)return;const{ctx}=ch;ctx.save();ctx.fillStyle='#dbe4f5';ctx.font='10px Courier New';const last=ch.data.datasets.length-1;ch.getDatasetMeta(last).data.forEach((bar,i)=>{const t=ch.data.datasets.reduce((s,d)=>s+(d.data[i]||0),0);ctx.fillText(t,bar.x+4,bar.y+3);});ctx.restore();}};
+if(window.Chart)Chart.register(centerPlugin,peaksPlugin,totalsPlugin);
+let topSort={k:'score',dir:-1},lastAna=null;
+async function loadAnalytics(){
+ try{const r=await fetch('/api/analytics2?hours='+$('anRange').value);const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);lastAna=j;renderAnalytics(j);}
+ catch(e){toast('Analytics: '+e.message);}
+}
+function renderAnalytics(j){
+ $('anNote').textContent=(j.note||'')+' · muestra de '+j.sample_rows+' filas para correlación/regiones.';
+ const k=j.kpis;
+ $('anKpis').innerHTML=KPI_DEF.map(([id,l,c,upBad],i)=>{const cur=k.cur[id],prev=k.prev[id],d=cur-prev;const up=d>0,col=d===0?'var(--dim)':(upBad?(up?'var(--red)':'var(--green)'):(up?'var(--green)':'var(--red)'));
+  return `<div class="k6"><div class="kl">${esc(l)}</div><div class="kv" style="color:${c}">${esc(cur)}${id.indexOf('rate')>=0||id==='esc_mean'?'%':''}</div><div class="kd" style="color:${col}">${d===0?'=':(up?'↑':'↓')} ${esc(Math.abs(d).toFixed(id==='total'||id==='critical'||id==='high'?0:1))} vs ventana anterior</div><canvas id="sp${i}" width="60" height="20" style="width:60px;height:20px"></canvas></div>`;}).join('');
+ KPI_DEF.forEach(([id,,c],i)=>{const col=({'var(--text)':'#dbe4f5','var(--red)':'#ff3344','var(--orange)':'#ff8800','var(--green)':'#2cf5a6'})[c]||c;
+  if(charts['sp'+i]){charts['sp'+i].destroy();delete charts['sp'+i];}
+  charts['sp'+i]=new Chart($('sp'+i).getContext('2d'),{type:'line',data:{labels:k.spark[id].map((_,x)=>x),datasets:[{data:k.spark[id],borderColor:col,borderWidth:1.5,pointRadius:0,tension:.3}]},options:{responsive:false,animation:false,plugins:{legend:{display:false},tooltip:{enabled:false}},scales:{x:{display:false},y:{display:false}}}});});
+ $('anGauge').innerHTML=gaugeSvg(j.gauge.value,j.gauge.state,j.gauge.parts);
+ const ty=j.types;
+ mkChart('anType',{type:'bar',data:{labels:ty.map(x=>x[0]),datasets:[{data:ty.map(x=>x[1]),backgroundColor:ty.map(x=>TYPE_COL[x[0]]||'#666')}]},options:{indexAxis:'y',responsive:true,plugins:{legend:{display:false}},scales:{x:Object.assign({beginAtZero:true},AX),y:Object.assign({},AX)},onClick:(e,els)=>{if(!els.length)return;const t=ty[els[0].index][0];if(t==='Otros')return;$('fSearch').value=t;onFilterChange();document.querySelector('.tab[data-tab="feed"]').click();toast('Filtrando por '+t);}}});
+ const cr=['A','B','C','D'],cc=['#2cf5a6','#5ee7ff','#ffd60a','#c77dff'],ctot=cr.reduce((s,x)=>s+(j.cred[x]||0),0);
+ mkChart('anCred',{type:'doughnut',data:{labels:cr,datasets:[{data:cr.map(x=>j.cred[x]||0),backgroundColor:cc,borderColor:'#111'}]},options:{responsive:true,cutout:'62%',plugins:{centerTxt:{text:String(ctot)},legend:{position:'right',labels:{generateLabels:ch=>cr.map((x,i)=>({text:x+' · '+(j.cred[x]||0)+' ('+(ctot?(100*(j.cred[x]||0)/ctot).toFixed(1):0)+'%)',fillStyle:cc[i],strokeStyle:cc[i],index:i}))}}}}});
+ const ts=j.timeseries;
+ mkChart('anTime',{type:'line',data:{labels:ts.labels,datasets:[{label:'Eventos',data:ts.total,borderColor:'#5ee7ff',backgroundColor:'#5ee7ff',tension:.3,pointRadius:0,yAxisID:'y'},{label:'Críticos',data:ts.critical,borderColor:'#ff3344',backgroundColor:'#ff3344',tension:.3,pointRadius:0,yAxisID:'y'},{label:'% críticos',data:ts.pct,borderColor:'#ff8800',borderDash:[3,3],borderWidth:1,tension:.3,pointRadius:0,yAxisID:'y1'}]},
+  options:{responsive:true,plugins:{peaksLn:{idx:ts.peaks},legend:{labels:{font:{size:10}}}},scales:{x:Object.assign({},AX,{ticks:{color:'#888',font:{size:9},maxTicksLimit:6}}),y:Object.assign({beginAtZero:true,position:'left'},AX),y1:Object.assign({beginAtZero:true,max:100,position:'right'},AX,{grid:{drawOnChartArea:false}})}}});
+ const rg=j.regions,sv=['critical','high','medium','low'],sc=['#ff3344','#ff8800','#ffcc00','#9aa7bd'];
+ mkChart('anReg',{type:'bar',data:{labels:rg.map(r=>r.region),datasets:sv.map((s,i)=>({label:s,data:rg.map(r=>r[s]),backgroundColor:sc[i]}))},options:{indexAxis:'y',responsive:true,plugins:{totalsEnd:true,legend:{labels:{font:{size:10}}}},layout:{padding:{right:24}},scales:{x:Object.assign({stacked:true,beginAtZero:true},AX),y:Object.assign({stacked:true},AX)}}});
+ renderCalendar(j.calendar,j.cal_days);
+ const rd=j.radar;
+ mkChart('anRadar',{type:'radar',data:{labels:rd.labels,datasets:[{label:'Ventana actual',data:rd.cur,borderColor:'#5ee7ff',backgroundColor:'rgba(94,231,255,.25)'},{label:'Ventana anterior',data:rd.prev,borderColor:'#9aa7bd',backgroundColor:'rgba(154,167,189,.15)'}]},options:{responsive:true,scales:{r:{min:0,max:100,ticks:{color:'#888',backdropColor:'transparent'},grid:{color:'#243152'},angleLines:{color:'#243152'},pointLabels:{color:'#dbe4f5',font:{size:9}}}}}});
+ renderTop();renderSankey(j.sankey);
+}
+function renderCalendar(cal,days){
+ const end=new Date();end.setHours(0,0,0,0);const start=new Date(end.getTime()-(days-1)*86400000);
+ const dow=(start.getDay()+6)%7;const cells=[];for(let i=0;i<dow;i++)cells.push(null);
+ for(let i=0;i<days;i++){const d=new Date(start.getTime()+i*86400000);const k=d.toISOString().slice(0,10);cells.push({k,n:cal[k]||0});}
+ const mx=Math.max(1,...cells.filter(Boolean).map(c=>c.n)),pal=['#1b2740','#1f6f8b','#2aa5a0','#2cf5a6','#d9ff5e'];
+ $('anCal').innerHTML='<div class="cal">'+['L','M','X','J','V','S','D'].map(d=>`<div class="h">${d}</div>`).join('')+cells.map(c=>c?`<div title="${esc(c.k)}: ${c.n} eventos" style="background:${pal[c.n?Math.min(4,1+Math.floor(3.99*c.n/mx)):0]}">${c.n||''}</div>`:'<div style="background:none"></div>').join('')+'</div>';
+}
+function renderTop(){
+ const rows=((lastAna||{}).top10||[]).slice().sort((a,b)=>topSort.dir*((a[topSort.k]>b[topSort.k])-(a[topSort.k]<b[topSort.k])));
+ const th=(k,l)=>`<th onclick="topSort={k:'${k}',dir:topSort.k==='${k}'?-topSort.dir:-1};renderTop()">${l}${topSort.k===k?(topSort.dir<0?' ▼':' ▲'):''}</th>`;
+ $('anTop').innerHTML=rows.length?`<table class="tb"><tr><th></th><th>Región/Fuente</th>${th('score','Score')}${th('prob','% escal.')}${th('detected_at','Hora')}<th></th></tr>`+rows.map(r=>`<tr style="cursor:pointer" onclick="openDossier({fingerprint:'${esc(r.fingerprint)}',type:'${esc(r.type)}',severity:'${esc(r.severity)}',description:'${esc(r.description.replace(/'/g,' '))}',source:'${esc(r.source)}',detected_at:'${esc(r.detected_at)}'})"><td>${TYPE_EMOJI[r.type]||'•'}</td><td>${esc(r.region)}<div class="meta">${esc(r.source)}</div></td><td>${r.score}</td><td>${Number(r.prob).toFixed(0)}%</td><td>${esc(fmtTime(r.detected_at))}</td><td onclick="event.stopPropagation()"><button class="btn sm" onclick="alertAction('${esc(r.fingerprint)}','fp')">🚫 FP</button> <button class="btn sm btn-red" onclick="alertAction('${esc(r.fingerprint)}','deleted')">🗑</button></td></tr>`).join('')+'</table>':'<div class="hint">Sin alertas.</div>';
+}
+async function renderSankey(sk){
+ const box=$('anSankey');
+ try{await loadScript('https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js');await loadScript('https://cdn.jsdelivr.net/npm/d3-sankey@0.12.3/dist/d3-sankey.min.js');}catch(e){box.innerHTML='<div class="hint">No se pudo cargar D3 (¿sin internet / CDN bloqueado?).</div>';return;}
+ if(!sk.links.length){box.innerHTML='<div class="hint">Sin datos.</div>';return;}
+ const names=Array.from(new Set(sk.links.flatMap(l=>[l.source,l.target]))),idx=Object.fromEntries(names.map((n,i)=>[n,i]));
+ const W=410,H=Math.max(260,names.length*14);
+ const g=d3.sankey().nodeWidth(12).nodePadding(8).extent([[2,4],[W-2,H-4]])({nodes:names.map(n=>({name:n})),links:sk.links.map(l=>({source:idx[l.source],target:idx[l.target],value:l.value}))});
+ const col=n=>n.startsWith('S:')?'#5ee7ff':n.startsWith('T:')?'#c77dff':(SEV_COL[n.slice(2)]||'#9aa7bd');
+ box.innerHTML=`<svg viewBox="0 0 ${W} ${H}" width="100%">${g.links.map(l=>`<path d="${d3.sankeyLinkHorizontal()(l)}" fill="none" stroke="${col(l.source.name)}" stroke-opacity=".35" stroke-width="${Math.max(1,l.width)}"><title>${esc(l.source.name.slice(2))} → ${esc(l.target.name.slice(2))}: ${l.value}</title></path>`).join('')}${g.nodes.map(n=>`<rect x="${n.x0}" y="${n.y0}" width="${n.x1-n.x0}" height="${Math.max(1,n.y1-n.y0)}" fill="${col(n.name)}"><title>${esc(n.name.slice(2))}: ${n.value}</title></rect><text x="${n.x0<W/2?n.x1+4:n.x0-4}" y="${(n.y0+n.y1)/2}" dy=".35em" text-anchor="${n.x0<W/2?'start':'end'}" fill="#dbe4f5" font-size="8">${esc(n.name.slice(2,22))}</text>`).join('')}</svg>`;
+}
+
+/* ---------- GRAFO (Cytoscape) ---------- */
+let cy=null,gOnlyCorr=true,gShowFP=false,gHours=24,pulseGraphT=null;
+function hideGraph(){$('graphOv').style.display='none';if(pulseGraphT){clearInterval(pulseGraphT);pulseGraphT=null;}}
+function graphBar(){
+ $('graphBar').innerHTML=`<b style="color:var(--green)">🕸 GRAFO</b><select id="gWin" class="fi" style="flex:0 0 90px"><option value="24">24 h</option><option value="168">7 d</option><option value="720">30 d</option></select>
+ <button class="btn" onclick="cy&&cy.zoom(cy.zoom()*1.25)">＋</button><button class="btn" onclick="cy&&cy.zoom(cy.zoom()/1.25)">−</button><button class="btn" onclick="cy&&cy.fit(undefined,40)">AJUSTAR</button>
+ <label style="font-size:10px"><input type="checkbox" id="gCorr" ${gOnlyCorr?'checked':''}> solo correlacionados</label><label style="font-size:10px"><input type="checkbox" id="gFP" ${gShowFP?'checked':''}> mostrar FP</label><button class="btn" onclick="hideGraph()">✕</button>`;
+ $('gWin').value=String(gHours);
+ $('gWin').onchange=()=>{gHours=+$('gWin').value;openGraph();};$('gCorr').onchange=()=>{gOnlyCorr=$('gCorr').checked;openGraph();};$('gFP').onchange=()=>{gShowFP=$('gFP').checked;applyGraphFilter();};
+ $('graphLeg').innerHTML='<b>Nodos</b> (color = severidad, borde punteado = FP)<br>'+[['missile_alert','Alerta'],['telegram_signal','Telegram'],['news','Noticia'],['official_statement','Comunicado'],['seismic_explosion','Explosión'],['thermal_anomaly','Térmico']].map(([t,l])=>`<span>${TYPE_EMOJI[t]} ${l}</span> `).join('')+'<br><span style="color:#ff3344">●</span>crit <span style="color:#ff8800">●</span>high <span style="color:#ffcc00">●</span>med <span style="color:#9aa7bd">●</span>low';
+}
+function applyGraphFilter(){if(!cy)return;cy.nodes().forEach(n=>{n.style('display',(n.data('fp')&&!gShowFP)||n.data('deleted')?'none':'element');});cy.edges().forEach(e=>{e.style('display',(e.source().style('display')==='none'||e.target().style('display')==='none')?'none':'element');});}
+async function openGraph(){
+ if(document.body.classList.contains('sb-full'))setSbMode('half');
+ $('graphOv').style.display='block';graphBar();$('graphSide').innerHTML='<div class="hint">Cargando grafo...</div>';
+ try{await loadScript('https://cdn.jsdelivr.net/npm/cytoscape@3.28.0/dist/cytoscape.min.js');}catch(e){$('graphSide').innerHTML='<div class="error-banner">'+esc(e.message)+'</div>';return;}
+ try{const r=await fetch('/api/graph?hours='+gHours+'&all='+(gOnlyCorr?0:1));const j=await r.json();if(!r.ok)throw new Error(j.error||r.status);
+  if(cy){cy.destroy();cy=null;}
+  cy=cytoscape({container:$('graphCy'),elements:{nodes:j.nodes,edges:j.edges},wheelSensitivity:.3,
+   style:[{selector:'node',style:{'width':n=>20+(n.data('score')/10)*3,'height':n=>20+(n.data('score')/10)*3,'background-color':'data(color)','border-width':2,'border-color':'#0b0f1a','label':n=>(TYPE_EMOJI[n.data('type')]||'•')+' '+(n.data('place')||'').slice(0,12),'font-size':9,'color':'#dbe4f5','text-valign':'bottom','text-margin-y':3,'text-outline-color':'#0b0f1a','text-outline-width':2}},
+    {selector:'node[?fp]',style:{'border-style':'dashed','border-color':'#9aa7bd','border-width':3,'opacity':.7}},
+    {selector:'edge',style:{'width':e=>1+e.data('strength'),'curve-style':'bezier','line-fill':'linear-gradient','line-gradient-stop-colors':e=>[e.source().data('color'),e.target().data('color')],'line-gradient-stop-positions':'0% 100%','opacity':.8}},
+    {selector:'.dim',style:{'opacity':.12}},{selector:'node:selected',style:{'border-color':'#fff','border-width':4}},{selector:'edge.pulse',style:{'opacity':.25}}],
+   layout:{name:'cose',animate:true,animationDuration:700,nodeRepulsion:()=>9000,idealEdgeLength:()=>70}});
+  cy.on('tap','node',e=>selectGraphNode(e.target));cy.on('tap',e=>{if(e.target===cy){cy.elements().removeClass('dim');$('graphSide').innerHTML='<div class="hint">Haz clic en un nodo.</div>';}});
+  cy.on('dbltap','node',e=>{$('fSearch').value=e.target.data('place')||e.target.data('type');onFilterChange();toast('Panel filtrado por '+$('fSearch').value);});
+  applyGraphFilter();
+  if(pulseGraphT)clearInterval(pulseGraphT);
+  if(!REDUCED)pulseGraphT=setInterval(()=>{if(!cy)return;const on=Math.floor(Date.now()/700)%2;cy.edges('[?crit]').forEach(e=>on?e.addClass('pulse'):e.removeClass('pulse'));},700);
+  $('graphSide').innerHTML=`<div class="hint">${j.stats.nodes} nodos · ${j.stats.edges} aristas · ${j.stats.incidents} incidentes. ${j.nodes.length?'Clic en un nodo.':'Sin correlaciones en esta ventana.'}</div>`;
+ }catch(e){$('graphSide').innerHTML='<div class="error-banner">'+esc(e.message)+'</div>';}
+}
+function selectGraphNode(n){
+ cy.elements().addClass('dim');const nb=n.closedNeighborhood();nb.removeClass('dim');const d=n.data();
+ const neigh=n.neighborhood('node').map(x=>x.data());
+ $('graphSide').innerHTML=`<b>${TYPE_EMOJI[d.type]||''} ${esc(d.type)} · ${esc(d.place)}</b><div><span class="sevtag" style="color:${d.color};border-color:${d.color}">${esc(d.severity)}</span> <span class="credtag cred-${esc(d.cred)}">${esc(d.cred)}</span> escalada ${Number(d.prob).toFixed(0)}% · score ${d.score}${d.fp?' · <b>FP</b>':''}</div>
+ <div class="tt-b">${esc(d.description)}</div><div class="hint">${esc(fmtDateTime(d.detected_at))} · ${esc(d.source)}</div>
+ <h4 style="color:var(--yellow);font-size:10px">VECINOS CORRELACIONADOS (${neigh.length})</h4>${neigh.map(x=>`<div class="tg-msg" style="cursor:pointer" data-id="${esc(x.id)}" onclick="cy.getElementById(this.dataset.id).emit('tap')"><b>${esc(x.source)}</b> — ${esc(x.description.slice(0,80))}</div>`).join('')||'<div class="hint">—</div>'}
+ <div class="frow" style="margin-top:8px"><button class="btn" onclick="graphToMap('${esc(d.id)}')">VER EN EL MAPA</button><button class="btn" onclick="alertAction('${esc(d.id)}','fp')">🚫 FP</button><button class="btn btn-red" onclick="alertAction('${esc(d.id)}','deleted')">🗑</button></div>`;
+}
+function graphToMap(id){const n=cy&&cy.getElementById(id);if(!n||!n.length)return;const d=n.data();hideGraph();document.querySelector('.tab[data-tab="feed"]').click();if(d.lat!=null&&d.lon!=null)map.flyTo({center:[+d.lon,+d.lat],zoom:7,duration:900});openDossier({fingerprint:id,type:d.type,severity:d.severity,description:d.description,source:d.source,detected_at:d.detected_at,place:d.place});}
+
+/* ---------- panel lateral: ancho variable (oculto / normal / mitad / completo / arrastre) ---------- */
+let sbW=450;
+function setSbWidth(w,persist){
+ const mainW=document.querySelector('.main').clientWidth||window.innerWidth;
+ w=Math.max(0,Math.min(Math.round(w),mainW));
+ sbW=w;const sb=document.querySelector('.sidebar');
+ sb.style.display=w<40?'none':'flex';
+ document.documentElement.style.setProperty('--sbw',(w<40?0:w)+'px');
+ document.body.classList.toggle('sb-full',w>=mainW-2);document.body.classList.toggle('sb-wide',w>=700);
+ $('sbToggle').textContent=w<40?'◀':'▶';
+ if(persist){try{localStorage.setItem('gewom_sbw',String(w));}catch(e){}}
+ clearTimeout(setSbWidth._t);setSbWidth._t=setTimeout(()=>{try{map.resize();}catch(e){}},80);
+}
+function setSbMode(m){const mw=document.querySelector('.main').clientWidth||window.innerWidth;setSbWidth(m==='min'?0:m==='half'?mw/2:m==='full'?mw:450,true);}
+document.querySelectorAll('#sbBar .btn').forEach(b=>b.addEventListener('click',()=>setSbMode(b.dataset.m)));
+$('sbToggle').addEventListener('click',()=>setSbMode(sbW<40?'normal':'min'));
+(function(){const d=$('sbDrag');let on=false;
+ d.addEventListener('mousedown',e=>{on=true;d.classList.add('on');e.preventDefault();});
+ window.addEventListener('mousemove',e=>{if(!on)return;const r=document.querySelector('.main').getBoundingClientRect();setSbWidth(r.right-e.clientX,false);});
+ window.addEventListener('mouseup',()=>{if(!on)return;on=false;d.classList.remove('on');setSbWidth(sbW,true);});
+ window.addEventListener('resize',()=>{const mw=document.querySelector('.main').clientWidth;if(sbW>mw)setSbWidth(mw,false);});
+ d.addEventListener('dblclick',()=>setSbMode('normal'));})();
+try{const w=parseInt(localStorage.getItem('gewom_sbw')||'',10);if(isFinite(w))setSbWidth(w,false);}catch(e){}
+/* ---------- botones rápidos ---------- */
+function qCritical(){const on=$('fSev').value==='critical';$('fSev').value=on?'':'critical';$('qCrit').classList.toggle('active',!on);onFilterChange();}
+function qCorr(){F.onlyCorr=!F.onlyCorr;saveF();syncFilterUI();onFilterChange();toast(F.onlyCorr?'Solo cruzadas':'Todas');}
+function qNow(){F.ageIdx=F.ageIdx===4?0:4;saveF();syncFilterUI();onFilterChange();toast(F.ageIdx?'Última hora':'Todo el rango');}
+function qZone(){if(F.zone){clearZone();return;}if(document.body.classList.contains('sb-full'))setSbMode('normal');startDraw();}
+function qPause(){document.getElementById('autoBtn').click();}
+function qFs(){try{if(document.fullscreenElement)document.exitFullscreen();else document.documentElement.requestFullscreen();}catch(e){toast('No disponible');}}
+function sumText(){const v=getVisible().slice().sort((a,b)=>(b.score||0)-(a.score||0)||(SEV_COL[b.severity]?1:0)).slice(0,10);
+ return 'GEWOM — resumen '+new Date().toLocaleString()+'\n'+(v.length?v.map((a,i)=>(i+1)+'. ['+a.severity+'/'+(a.cred||'D')+'] '+(a.place||a.region||'')+' · '+a.source+' · '+String(a.description||'').slice(0,140)).join('\n'):'Sin alertas con los filtros actuales.');}
+function qCopy(){navigator.clipboard.writeText(sumText()).then(()=>toast('Resumen copiado'),()=>toast('No se pudo copiar'));}
+function qSum(){const m=document.createElement('div');m.className='modal';m.innerHTML='<div><h4 style="color:var(--yellow)">Resumen rápido</h4><pre style="white-space:pre-wrap;font-size:11px"></pre><div class="frow"><button class="btn" id="smCp">COPIAR</button><button class="btn" id="smX">CERRAR</button></div></div>';document.body.appendChild(m);m.querySelector('pre').textContent=sumText();$('smX').onclick=()=>m.remove();$('smCp').onclick=()=>{qCopy();};m.addEventListener('click',e=>{if(e.target===m)m.remove();});}
+/* ---------- hooks / arranque ---------- */
+const _fv=fillSources;fillSources=function(){_fv();buildFilterPanel();syncFilterUI();};
+window.addEventListener('DOMContentLoaded',()=>{buildFilterPanel();});
+buildFilterPanel();
+/* títulos GEWOM */
+document.title='GEWOM';document.querySelectorAll('.header h1').forEach(h=>{h.textContent='▶ GEWOM — GLOBAL EARLY WARNING';});
+</script>
+"""
+
+base.HTML_PANEL = base.HTML_PANEL.replace("</body>", EXTRA_UI26 + "</body>", 1) if "</body>" in base.HTML_PANEL else base.HTML_PANEL
+
+
+# ============================================================
+# ===== ENDURECIMIENTO (seguridad) — no cambia ninguna función =====
+# ============================================================
+def _hrs(default: float = 24.0) -> float:
+    """Horas de la petición, acotadas (evita NaN/inf/valores absurdos)."""
+    try:
+        v = float(request.args.get("hours", default))
+    except (TypeError, ValueError):
+        v = default
+    if v != v or v in (float("inf"), float("-inf")):
+        v = default
+    return max(0.05, min(v, 24.0 * 365))
+
+
+app.config["MAX_CONTENT_LENGTH"] = 512 * 1024          # cuerpo máximo de una petición: 512 KB
+_EXPOSED = base.HOST in ("0.0.0.0", "::", "")
+_OK_HOSTS = {"127.0.0.1", "localhost", "::1", str(base.HOST).lower()}
+
+
+def _host_only(h: str) -> str:
+    h = (h or "").lower().strip()
+    if h.startswith("["):
+        return h.split("]")[0] + "]"
+    return h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+
+
+@app.before_request
+def _guard_request():
+    """Anti DNS-rebinding y anti CSRF: una web externa no puede mandar órdenes a tu GEWOM local."""
+    if not _EXPOSED:
+        hh = _host_only(request.host)
+        if hh not in _OK_HOSTS and hh.strip("[]") not in _OK_HOSTS:
+            return jsonify({"error": "Host no permitido"}), 403
+    if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+        org = request.headers.get("Origin")
+        if org and org != "null" and urlparse(org).netloc != request.host:
+            return jsonify({"error": "Origen no permitido"}), 403
+        if org == "null" or request.headers.get("Sec-Fetch-Site") == "cross-site":
+            return jsonify({"error": "Petición cruzada bloqueada"}), 403
+    return None
+
+
+@app.after_request
+def _sec_headers(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    if request.path.startswith("/api/report"):
+        resp.headers["Content-Security-Policy"] = "sandbox allow-same-origin; script-src 'none'; object-src 'none'"
+    return resp
+
+
+_q_before_guard = base.query_history
+
+
+def _q_safe(hours: float = 24, source: str = "", q: str = "", limit: int = 500):
+    try:
+        hours = float(hours)
+    except (TypeError, ValueError):
+        hours = 24.0
+    if hours != hours:
+        hours = 24.0
+    return _q_before_guard(hours=max(0.05, min(hours, 24.0 * 365)), source=str(source or "")[:120], q=str(q or "")[:200],
+                           limit=max(1, min(int(limit or 500), 10000)))
+
+
+base.query_history = _q_safe
+
 # ============================================================
 # ARRANQUE
 # ============================================================
@@ -5462,7 +6686,7 @@ if __name__ == "__main__":
     if port != base.PORT:
         print(f"  [!] Puerto {base.PORT} ocupado -> usando el puerto {port}")
     print("=" * 62)
-    print(f"  GLOBAL EARLY WARNING OSINT — v{VERSION}  (sobre {BASE_MODULE}.py)")
+    print(f"  GEWOM — Global Early Warning Monitor v{VERSION}")
     print(f"  http://{base.HOST}:{port}")
     print(f"  Fuentes: {len(base.SOURCES)} módulos · feeds RSS {len(base.RSS_FEEDS)} · guerra {len(base.WAR_FEEDS)} · "
           f"comunicados {len(base.STATEMENT_FEEDS)} · estatales {len(base.STATE_MEDIA_FEEDS)} · Telegram {len(base.TELEGRAM_CHANNELS)}")
