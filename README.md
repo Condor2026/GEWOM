@@ -85,6 +85,20 @@ nano .env      # opcional: claves API
 
 Abre 👉 http://127.0.0.1:5000
 
+## 🐧 Linux / macOS
+```bash
+cd ~/GEWOM.py          # o donde tengas la carpeta
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+python GEWOM.py
+```
+
+## Si no tienes requirements.txt:
+```bash
+pip install flask requests beautifulsoup4 urllib3
+```
+
 ### Instalación manual
 
 ```bash
